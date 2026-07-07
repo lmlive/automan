@@ -100,6 +100,12 @@ function RightSidebarInner(): React.JSX.Element {
         shortcut: ''
       },
       {
+        id: 'orchestration',
+        icon: Workflow,
+        title: translate('auto.components.right.sidebar.index.orchestration', 'Orchestration'),
+        shortcut: ''
+      },
+      {
         id: 'workspaces',
         icon: Workflow,
         title: translate(

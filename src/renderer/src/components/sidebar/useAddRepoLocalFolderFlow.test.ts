@@ -82,6 +82,40 @@ describe('useAddRepoLocalFolderFlow', () => {
     onGitRepoReady.mockResolvedValue(undefined)
   })
 
+  it('shows feedback when the browser has no local folder picker result', async () => {
+    const { toast } = await import('sonner')
+    pickFolders.mockResolvedValue([])
+    ;(window as unknown as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__ = true
+    const { useAddRepoLocalFolderFlow } = await import('./useAddRepoLocalFolderFlow')
+
+    const { handleBrowse } = useAddRepoLocalFolderFlow({
+      isOpen: true,
+      droppedLocalPath: '',
+      activeRuntimeEnvironmentId: null,
+      addRepoPath,
+      closeModal,
+      fetchWorktrees,
+      scanNestedRepos,
+      setActiveNestedScanId,
+      setNestedScanInProgress,
+      showNestedRepoReview,
+      onGitRepoReady,
+      setIsAdding,
+      setAddProjectBusyLabel
+    })
+
+    await handleBrowse()
+
+    expect(toast.error).toHaveBeenCalledWith(
+      'Local folder browsing is unavailable in the web client.',
+      {
+        description: 'Choose the Orca Server host, then enter or browse a path on that server.'
+      }
+    )
+    expect(scanNestedRepos).not.toHaveBeenCalled()
+    expect(addRepoPath).not.toHaveBeenCalled()
+  })
+
   it('adds every selected local folder and completes one default-checkout handoff', async () => {
     pickFolders.mockResolvedValue(['/projects/alpha', '/projects/beta'])
     const { useAddRepoLocalFolderFlow } = await import('./useAddRepoLocalFolderFlow')

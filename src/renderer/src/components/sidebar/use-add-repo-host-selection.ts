@@ -14,6 +14,10 @@ import { useSidebarHostScopeOptions } from './use-sidebar-host-scope-options'
 import { canSelectAddRepoHost } from './add-repo-host-availability'
 import { translate } from '@/i18n/i18n'
 
+function isWebClient(): boolean {
+  return Boolean((window as unknown as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__)
+}
+
 export function useAddRepoHostSelection({
   isOpen,
   setStep
@@ -77,11 +81,22 @@ export function useAddRepoHostSelection({
   useEffect(() => {
     if (isOpen && !previousOpenRef.current) {
       const focusedHostId = getSettingsFocusedExecutionHostId(settings)
-      const nextHostId = selectableHostOptions.some(
+      const focusedHostAvailable = selectableHostOptions.some(
         (host) => host.id === focusedHostId && canSelectAddRepoHost(host)
       )
-        ? focusedHostId
-        : LOCAL_EXECUTION_HOST_ID
+      const availableWebRuntimeHostId = isWebClient()
+        ? selectableHostOptions.find(
+            (host) => host.kind === 'runtime' && canSelectAddRepoHost(host)
+          )?.id
+        : null
+      // Why: a paired browser cannot open a client-local native folder picker;
+      // default it to the paired server host so Browse uses server-path flow.
+      const nextHostId =
+        availableWebRuntimeHostId && focusedHostId === LOCAL_EXECUTION_HOST_ID
+          ? availableWebRuntimeHostId
+          : focusedHostAvailable
+            ? focusedHostId
+            : (availableWebRuntimeHostId ?? LOCAL_EXECUTION_HOST_ID)
       setSelectedAddProjectHostId(nextHostId)
     }
     if (!isOpen) {

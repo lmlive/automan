@@ -214,6 +214,16 @@ describe('useAddRepoHostSelection', () => {
     expect(setStep).toHaveBeenCalledWith('add')
   })
 
+  it('defaults to an available runtime host in the web client', async () => {
+    mocks.stateValues = ['local', false]
+    ;(window as unknown as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__ = true
+    const { useAddRepoHostSelection } = await import('./use-add-repo-host-selection')
+
+    useAddRepoHostSelection({ isOpen: true, setStep: vi.fn() })
+
+    expect(mocks.stateSetters[0]).toHaveBeenCalledWith('runtime:env-1')
+  })
+
   it('does not auto-select the active runtime host while it is unavailable', async () => {
     mocks.stateValues = ['local', false]
     mocks.hostOptions[2] = {

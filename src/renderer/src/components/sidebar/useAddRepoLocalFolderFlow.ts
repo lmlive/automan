@@ -1,3 +1,4 @@
+/* eslint-disable max-lines -- Why: local folder add flow keeps dialog orchestration, scan telemetry, and nested repo review state together; splitting now would obscure the flow being tested. */
 import { useCallback, useEffect, useRef } from 'react'
 import { toast } from 'sonner'
 import { track } from '@/lib/telemetry'
@@ -27,6 +28,10 @@ type LocalPathAddResult =
   | { status: 'cancelled' | 'paused' | 'skipped' }
 
 type LocalPathAddMode = 'single' | 'batch'
+
+function isWebClient(): boolean {
+  return Boolean((window as unknown as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__)
+}
 
 export function useAddRepoLocalFolderFlow({
   isOpen,
@@ -283,7 +288,24 @@ export function useAddRepoLocalFolderFlow({
     setAddProjectBusyLabel('Choose a folder...')
     try {
       const paths = await window.api.repos.pickFolders()
-      if (paths.length === 0 || gen !== localAddGenRef.current) {
+      if (paths.length === 0) {
+        if (isWebClient()) {
+          toast.error(
+            translate(
+              'auto.components.sidebar.useAddRepoLocalFolderFlow.webFolderPickerUnavailable',
+              'Local folder browsing is unavailable in the web client.'
+            ),
+            {
+              description: translate(
+                'auto.components.sidebar.useAddRepoLocalFolderFlow.webFolderPickerUnavailableDescription',
+                'Choose the Orca Server host, then enter or browse a path on that server.'
+              )
+            }
+          )
+        }
+        return
+      }
+      if (gen !== localAddGenRef.current) {
         return
       }
       await handleAddLocalPaths(paths, 'local_folder_picker', gen)

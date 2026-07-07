@@ -1,4 +1,5 @@
 /* eslint-disable max-lines -- Why: RPC method definitions co-locate param schemas with handlers; splitting by method would scatter the shared enums and Zod transforms without reducing complexity. */
+import { execFile } from 'node:child_process'
 import { z } from 'zod'
 import { defineMethod, type RpcMethod } from '../core'
 import { OptionalFiniteNumber, OptionalString, OptionalBoolean, requiredString } from '../schemas'
@@ -176,6 +177,14 @@ const ResetParams = z
       })
     }
   })
+
+const DecomposeParams = z.object({
+  request: z.string().min(1, 'Missing request'),
+  paths: z.array(z.string()).optional(),
+  // Why: allow callers to override the agent binary for testing or
+  // when the user has a non-standard `claude` install path.
+  claudeCommand: z.string().optional()
+})
 
 export const ORCHESTRATION_METHODS: RpcMethod[] = [
   defineMethod({
@@ -638,6 +647,105 @@ export const ORCHESTRATION_METHODS: RpcMethod[] = [
         return { reset: 'messages' }
       }
       throw new Error('Invalid reset scope')
+    }
+  }),
+
+  // Why: the runtime coordinator does not decompose yet, so the renderer needs
+  // an RPC endpoint that runs `claude --print` headlessly to turn a user request
+  // into a structured DAG. A future phase will replace this with native-chat
+  // integration or coordinator-level AI decomposition once the LLM path is
+  // decoupled from the CLI binary.
+  defineMethod({
+    name: 'orchestration.decompose',
+    params: DecomposeParams,
+    handler: async (params) => {
+      const claudeCommand = params.claudeCommand ?? 'claude'
+      const context =
+        params.paths && params.paths.length > 0
+          ? `\n\nThe user attached these files for context:\n${params.paths.map((p) => `- ${p}`).join('\n')}`
+          : ''
+
+      const systemPrompt = `You are a planning agent. Decompose the given request into a small DAG of 2-4 tasks that an AI coding agent can execute. Each task must have a clear title, a detailed spec, and dependency references.
+
+Output ONLY valid JSON matching this exact TypeScript type:
+{
+  "tasks": Array<{
+    "title": string,
+    "spec": string,
+    "deps": string[]
+  }>
+}
+
+Rules:
+- "deps" references are 1-based indices into the tasks array: ["#1"] depends on task 1, ["#1","#2"] on tasks 1 and 2.
+- The first task (index 0) must have an empty deps array.
+- Each "spec" must be self-contained and actionable by a single agent session.
+- Write specs in English.
+- Output ONLY the JSON object with NO markdown fences, no commentary.`
+
+      const prompt = `${systemPrompt}\n\nRequest:\n${params.request}${context}`
+
+      // Why: execFile (not spawn) collects all stdout before resolving, which is
+      // exactly what we need for --print mode. 120s timeout because headless
+      // Claude can take a while on complex decompositions.
+      const output = await new Promise<string>((resolve, reject) => {
+        const child = execFile(claudeCommand, ['--print', prompt], {
+          timeout: 120_000,
+          maxBuffer: 512 * 1024,
+          env: { ...process.env }
+        })
+        let stdout = ''
+        let stderr = ''
+        child.stdout?.on('data', (chunk: string) => {
+          stdout += chunk
+        })
+        child.stderr?.on('data', (chunk: string) => {
+          stderr += chunk
+        })
+        child.on('close', (code) => {
+          if (code === 0 && stdout.trim()) {
+            resolve(stdout.trim())
+          } else if (stdout.trim()) {
+            // Non-zero exit but we got output — still use it
+            resolve(stdout.trim())
+          } else {
+            reject(new Error(stderr.trim() || `claude --print exited with code ${code}`))
+          }
+        })
+        child.on('error', reject)
+      })
+
+      // Parse the JSON — try raw first, then strip markdown fences
+      let parsed: { tasks?: unknown }
+      try {
+        parsed = JSON.parse(output) as { tasks?: unknown }
+      } catch {
+        const jsonMatch = output.match(/```(?:json)?\s*([\s\S]*?)```/)
+        if (jsonMatch?.[1]) {
+          parsed = JSON.parse(jsonMatch[1].trim()) as { tasks?: unknown }
+        } else {
+          throw new Error('Failed to parse decompose output as JSON')
+        }
+      }
+
+      if (!Array.isArray(parsed.tasks)) {
+        throw new Error('Decompose output missing "tasks" array')
+      }
+
+      const tasks = parsed.tasks as {
+        title?: string
+        spec?: string
+        deps?: string[]
+      }[]
+
+      for (let i = 0; i < tasks.length; i += 1) {
+        if (!tasks[i].title || !tasks[i].spec) {
+          throw new Error(`Task at index ${i} missing "title" or "spec"`)
+        }
+        tasks[i].deps ??= []
+      }
+
+      return { tasks }
     }
   })
 ]
