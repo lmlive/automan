@@ -14,7 +14,10 @@ import {
 const { mockPtySpawn, mockPtyInstance } = vi.hoisted(() => ({
   mockPtySpawn: vi.fn(),
   mockPtyInstance: {
-    pid: 12345,
+    // Why: attach now proves the backing pid is alive before replaying, so the
+    // default managed PTY must report a live pid. Reuse the test runner's own
+    // pid — always alive — so unrelated attach tests are not seen as dead.
+    pid: process.pid,
     onData: vi.fn(),
     onExit: vi.fn(),
     write: vi.fn(),
@@ -28,7 +31,7 @@ vi.mock('node-pty', () => ({
   spawn: mockPtySpawn
 }))
 
-import { PtyHandler } from './pty-handler'
+import { PtyHandler, attachIdentityMismatches } from './pty-handler'
 import type { RelayDispatcher } from './dispatcher'
 
 function createMockDispatcher() {
@@ -609,6 +612,71 @@ describe('PtyHandler', () => {
     }
   )
 
+  it('reports not-found and reaps a reattach whose backing shell is dead', async () => {
+    // Why: a lingering managed entry whose child died without an onExit would
+    // otherwise attach-succeed with an empty replay and strand the pane on a
+    // black shell. A provably-dead pid must surface as not-found so the SSH
+    // provider maps it to SSH_SESSION_EXPIRED and the pane respawns fresh.
+    let onExitCb: ((evt: { exitCode: number }) => void) | undefined
+    mockPtySpawn.mockReturnValue({
+      ...mockPtyInstance,
+      onData: vi.fn(),
+      onExit: vi.fn((cb: (evt: { exitCode: number }) => void) => {
+        onExitCb = cb
+      })
+    })
+    const exits: { id: string; paneKey?: string }[] = []
+    handler.setExitListener((evt) => exits.push(evt))
+
+    await dispatcher.callRequest('pty.spawn', { env: { ORCA_PANE_KEY: 'tab-dead:0' } })
+    expect(handler.activePtyCount).toBe(1)
+    expect(onExitCb).toBeDefined()
+
+    const aliveSpy = vi.spyOn(ptyShellUtils, 'isProcessAlive').mockReturnValue(false)
+    try {
+      await expect(
+        dispatcher.callRequest('pty.attach', { id: 'pty-1', suppressReplayNotification: true })
+      ).rejects.toThrow('PTY "pty-1" not found')
+    } finally {
+      aliveSpy.mockRestore()
+    }
+
+    // The stale entry is reaped: cache-eviction observers fire and the map slot
+    // is freed so a later attach also cleanly reports not-found.
+    expect(exits).toEqual([{ id: 'pty-1', paneKey: 'tab-dead:0' }])
+    expect(handler.activePtyCount).toBe(0)
+    await expect(
+      dispatcher.callRequest('pty.attach', { id: 'pty-1', suppressReplayNotification: true })
+    ).rejects.toThrow('PTY "pty-1" not found')
+  })
+
+  it('replays for a reattach whose backing shell is still alive', async () => {
+    // Guard the other direction: a live pid must never be reaped, so a quiet
+    // but live session still returns its buffered replay on reattach.
+    let dataCallback: ((data: string) => void) | undefined
+    mockPtySpawn.mockReturnValue({
+      ...mockPtyInstance,
+      onData: vi.fn((cb: (data: string) => void) => {
+        dataCallback = cb
+      }),
+      onExit: vi.fn()
+    })
+    await dispatcher.callRequest('pty.spawn', {})
+    dataCallback?.('prompt$ ')
+
+    const aliveSpy = vi.spyOn(ptyShellUtils, 'isProcessAlive').mockReturnValue(true)
+    try {
+      const result = await dispatcher.callRequest('pty.attach', {
+        id: 'pty-1',
+        suppressReplayNotification: true
+      })
+      expect(result).toEqual({ replay: 'prompt$ ' })
+    } finally {
+      aliveSpy.mockRestore()
+    }
+    expect(handler.activePtyCount).toBe(1)
+  })
+
   it('terminates spawned PTY when request becomes stale before response', async () => {
     const killSpy = vi.fn()
     const term = { ...mockPtyInstance, kill: killSpy, onData: vi.fn(), onExit: vi.fn() }
@@ -819,6 +887,51 @@ describe('PtyHandler', () => {
     })
     vi.advanceTimersByTime(8)
     expect(dispatcher.notify).not.toHaveBeenCalledWith('pty.data', expect.anything())
+  })
+
+  it('uses attach identity metadata without exporting it to the shell env', async () => {
+    const oldPaneKey = process.env.ORCA_PANE_KEY
+    const oldTabId = process.env.ORCA_TAB_ID
+    delete process.env.ORCA_PANE_KEY
+    delete process.env.ORCA_TAB_ID
+    try {
+      await dispatcher.callRequest('pty.spawn', {
+        env: { FOO: 'bar' },
+        paneKey: 'tab-a:leaf-a',
+        tabId: 'tab-a'
+      })
+    } finally {
+      if (oldPaneKey === undefined) {
+        delete process.env.ORCA_PANE_KEY
+      } else {
+        process.env.ORCA_PANE_KEY = oldPaneKey
+      }
+      if (oldTabId === undefined) {
+        delete process.env.ORCA_TAB_ID
+      } else {
+        process.env.ORCA_TAB_ID = oldTabId
+      }
+    }
+
+    const spawnOptions = mockPtySpawn.mock.calls[0][2] as { env: Record<string, string> }
+    expect(spawnOptions.env.ORCA_PANE_KEY).toBeUndefined()
+    expect(spawnOptions.env.ORCA_TAB_ID).toBeUndefined()
+
+    await expect(
+      dispatcher.callRequest('pty.attach', {
+        id: 'pty-1',
+        expectedPaneKey: 'tab-b:leaf-b',
+        expectedTabId: 'tab-b'
+      })
+    ).rejects.toThrow('PTY "pty-1" not found')
+
+    await expect(
+      dispatcher.callRequest('pty.attach', {
+        id: 'pty-1',
+        expectedPaneKey: 'tab-a:leaf-a',
+        expectedTabId: 'tab-a'
+      })
+    ).resolves.toEqual({})
   })
 
   it('notifies on PTY exit and removes from map', async () => {
@@ -1291,6 +1404,70 @@ describe('PtyHandler', () => {
     expect(callArgs.env.ORCA_AGENT_HOOK_TOKEN).toBe('abc-uuid')
   })
 
+  it('revive preserves attach identity metadata without exporting hook identity env', async () => {
+    const oldPaneKey = process.env.ORCA_PANE_KEY
+    const oldTabId = process.env.ORCA_TAB_ID
+    delete process.env.ORCA_PANE_KEY
+    delete process.env.ORCA_TAB_ID
+    try {
+      await dispatcher.callRequest('pty.spawn', {
+        cols: 90,
+        rows: 30,
+        cwd: '/tmp',
+        env: { FOO: 'bar' },
+        paneKey: 'tab-5:leaf-5',
+        tabId: 'tab-5'
+      })
+    } finally {
+      if (oldPaneKey === undefined) {
+        delete process.env.ORCA_PANE_KEY
+      } else {
+        process.env.ORCA_PANE_KEY = oldPaneKey
+      }
+      if (oldTabId === undefined) {
+        delete process.env.ORCA_TAB_ID
+      } else {
+        process.env.ORCA_TAB_ID = oldTabId
+      }
+    }
+    const state = (await dispatcher.callRequest('pty.serialize', { ids: ['pty-1'] })) as string
+
+    handler.dispose()
+    mockPtySpawn.mockClear()
+    dispatcher = createMockDispatcher()
+    handler = new PtyHandler(dispatcher as unknown as RelayDispatcher)
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true)
+    delete process.env.ORCA_PANE_KEY
+    delete process.env.ORCA_TAB_ID
+    try {
+      await dispatcher.callRequest('pty.revive', { state })
+    } finally {
+      killSpy.mockRestore()
+      if (oldPaneKey === undefined) {
+        delete process.env.ORCA_PANE_KEY
+      } else {
+        process.env.ORCA_PANE_KEY = oldPaneKey
+      }
+      if (oldTabId === undefined) {
+        delete process.env.ORCA_TAB_ID
+      } else {
+        process.env.ORCA_TAB_ID = oldTabId
+      }
+    }
+
+    const callArgs = mockPtySpawn.mock.calls[0][2] as { env: Record<string, string> }
+    expect(callArgs.env.ORCA_PANE_KEY).toBeUndefined()
+    expect(callArgs.env.ORCA_TAB_ID).toBeUndefined()
+
+    await expect(
+      dispatcher.callRequest('pty.attach', {
+        id: 'pty-1',
+        expectedPaneKey: 'tab-other:leaf',
+        expectedTabId: 'tab-other'
+      })
+    ).rejects.toThrow('PTY "pty-1" not found')
+  })
+
   it('invokes the exit listener with the spawn-time paneKey', async () => {
     let onExitCb: ((evt: { exitCode: number }) => void) | undefined
     mockPtySpawn.mockReturnValue({
@@ -1364,5 +1541,41 @@ describe('PtyHandler', () => {
       { id: 'pty-2', paneKey: 'tab-dispose:1' }
     ])
     expect(handler.activePtyCount).toBe(0)
+  })
+})
+
+describe('attachIdentityMismatches', () => {
+  it('rejects a paneKey collision across relay generations', () => {
+    // Old lease expects tab-a's pane; the reset relay's pty-1 belongs to tab-b.
+    expect(
+      attachIdentityMismatches({ paneKey: 'tab-a:0' }, { paneKey: 'tab-b:0', tabId: 'tab-b' })
+    ).toBe(true)
+  })
+
+  it('rejects a tabId collision when only tab identity is known', () => {
+    expect(attachIdentityMismatches({ tabId: 'tab-a' }, { tabId: 'tab-b' })).toBe(true)
+  })
+
+  it('accepts a matching identity', () => {
+    expect(
+      attachIdentityMismatches(
+        { paneKey: 'tab-a:0', tabId: 'tab-a' },
+        { paneKey: 'tab-a:0', tabId: 'tab-a' }
+      )
+    ).toBe(false)
+  })
+
+  it('stays permissive when the caller supplies no identity', () => {
+    expect(attachIdentityMismatches({}, { paneKey: 'tab-a:0', tabId: 'tab-a' })).toBe(false)
+  })
+
+  it('stays permissive when the managed PTY predates identity capture', () => {
+    expect(attachIdentityMismatches({ paneKey: 'tab-a:0', tabId: 'tab-a' }, {})).toBe(false)
+  })
+
+  it('does not reject on tabId when paneKey matches (split panes share a tab)', () => {
+    expect(
+      attachIdentityMismatches({ paneKey: 'tab-a:1' }, { paneKey: 'tab-a:1', tabId: 'tab-a' })
+    ).toBe(false)
   })
 })

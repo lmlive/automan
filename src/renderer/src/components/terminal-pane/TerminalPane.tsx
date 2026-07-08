@@ -178,6 +178,7 @@ import {
   resyncTerminalFocusForWindowFocus,
   setRegularTerminalInputFocusAttribute
 } from './regular-terminal-focus-ownership'
+import { refreshTerminalImeInputContext } from './terminal-ime-input-context-refresh'
 
 type TerminalPaneProps = {
   tabId: string
@@ -1048,7 +1049,13 @@ export default function TerminalPane({
       // Why: also clear the host buffer for remote-server panes, or the next
       // host snapshot replays the scrollback we just cleared locally.
       const ptyId = paneTransportsRef.current.get(pane.id)?.getPtyId() ?? null
-      clearWebRuntimeTerminalBuffer(ptyId)
+      const clearedRemoteHostBuffer = clearWebRuntimeTerminalBuffer(ptyId)
+      if (!clearedRemoteHostBuffer && ptyId) {
+        // Why: local/daemon/SSH PTYs keep their own screen state (ConPTY on
+        // Windows), and a stale host cursor row makes the next prompt repaint
+        // land below a blank gap after a frontend-only clear.
+        window.api.pty.clearBuffer(ptyId)
+      }
       persistLayoutSnapshot()
     },
     [paneTransportsRef, persistLayoutSnapshot]
@@ -1841,6 +1848,10 @@ export default function TerminalPane({
     }
     let ownsRegularTerminalFocus = false
     let releasedHelperOnWindowBlur: HTMLElement | null = null
+    // Why: the IME refresh's synchronous blur emits a focusout that would flip
+    // terminalInputFocused false mid-handoff; latch it so the main process keeps
+    // routing Terminal-first shortcuts until the refocus lands.
+    let refreshingImeInputContext = false
     const syncFocused = (focused: boolean): void => {
       ownsRegularTerminalFocus = focused
       if (focused) {
@@ -1850,8 +1861,20 @@ export default function TerminalPane({
       window.api.ui.setTerminalInputFocused?.(focused)
     }
     const onFocusIn = (event: FocusEvent): void => {
-      if (isXtermHelperTextarea(event.target)) {
-        syncFocused(true)
+      if (!isXtermHelperTextarea(event.target)) {
+        return
+      }
+      syncFocused(true)
+      // Why: helper→helper pane handoffs skip window blur and can leave a stale
+      // macOS NSTextInputContext; the refresh's refocus arrives with a
+      // non-helper relatedTarget, so this cannot recurse.
+      if (isXtermHelperTextarea(event.relatedTarget) && event.relatedTarget !== event.target) {
+        refreshingImeInputContext = true
+        try {
+          refreshTerminalImeInputContext(event.target, {})
+        } finally {
+          refreshingImeInputContext = false
+        }
       }
     }
     const onFocusOut = (event: FocusEvent): void => {
@@ -1859,6 +1882,9 @@ export default function TerminalPane({
         return
       }
       if (isXtermHelperTextarea(event.relatedTarget)) {
+        return
+      }
+      if (refreshingImeInputContext) {
         return
       }
       syncFocused(false)

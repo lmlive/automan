@@ -173,7 +173,11 @@ module.exports = {
     artifactName: 'orca-windows-setup.${ext}',
     shortcutName: '${productName}',
     uninstallDisplayName: '${productName}',
-    createDesktopShortcut: 'always'
+    createDesktopShortcut: 'always',
+    // Why: on a real uninstall, stop and remove the relocated terminal daemon
+    // (which lives outside the install dir under LOCALAPPDATA by design). Guarded
+    // by ${isUpdated} inside so it never runs during an update's uninstallOldVersion.
+    include: resolve(__dirname, 'nsis', 'daemon-host-uninstall.nsh')
   },
   mac: {
     icon: 'resources/build/icon.icns',

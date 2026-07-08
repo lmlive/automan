@@ -29,6 +29,10 @@ import { RelayStreamRegistry } from './fs-stream-registry'
 import { scanWorkspaceSpaceDirectory } from './workspace-space-scan'
 import { buildRelayCommandEnv } from './relay-command-env'
 import { assertNoClobberRenameDestinationAvailable } from '../shared/filesystem-rename-collision'
+import {
+  WATCHER_IGNORE_DIRS,
+  buildParcelWatcherIgnoreOption
+} from '../main/ipc/filesystem-watcher-ignore'
 
 type WatchState = {
   rootPath: string
@@ -82,7 +86,13 @@ export class FsHandler {
   constructor(dispatcher: RelayDispatcher, _context: RelayContext) {
     this.dispatcher = dispatcher
     this.registerHandlers()
-    this.dispatcher.onClientDetached?.((clientId) => this.releaseClientWatches(clientId))
+    this.dispatcher.onClientDetached?.((clientId) => {
+      this.releaseClientWatches(clientId)
+      // Why: a detached client's fs.streamAck frames will never arrive; wake
+      // any pump parked on the ack window so it re-checks staleness and exits
+      // instead of stranding its open file handle.
+      this.streamRegistry.wakeAllAckWaiters()
+    })
   }
 
   private registerHandlers(): void {
@@ -109,6 +119,7 @@ export class FsHandler {
     this.dispatcher.onRequest('fs.watch', (p, context) => this.watch(p, context))
     this.dispatcher.onNotification('fs.unwatch', (p, context) => this.unwatch(p, context))
     this.dispatcher.onNotification('fs.cancelStream', (p) => this.cancelStream(p))
+    this.dispatcher.onNotification('fs.streamAck', (p) => this.streamAck(p))
   }
 
   private async readDir(params: Record<string, unknown>) {
@@ -144,7 +155,13 @@ export class FsHandler {
   private async readFileStream(params: Record<string, unknown>, context?: RequestContext) {
     const filePath = expandTilde(params.filePath as string)
     const ctx = context ?? { clientId: 0, isStale: () => false }
-    return readRelayFileStreamMetadata(filePath, this.dispatcher, this.streamRegistry, ctx)
+    return readRelayFileStreamMetadata(filePath, this.dispatcher, this.streamRegistry, ctx, {
+      // Why: only target the requesting client when the dispatcher actually
+      // routed this request (context present) — direct-call tests and legacy
+      // paths keep broadcast semantics.
+      ...(context ? { clientId: context.clientId } : {}),
+      paceWithAcks: params.flowControl === 'ack'
+    })
   }
 
   private async tempDir(): Promise<string> {
@@ -155,6 +172,14 @@ export class FsHandler {
     const streamId = params.streamId as number | undefined
     if (typeof streamId === 'number') {
       this.streamRegistry.abort(streamId)
+    }
+  }
+
+  private streamAck(params: Record<string, unknown>): void {
+    const streamId = params.streamId as number | undefined
+    const seq = params.seq as number | undefined
+    if (typeof streamId === 'number' && typeof seq === 'number') {
+      this.streamRegistry.recordAck(streamId, seq)
     }
   }
 
@@ -408,7 +433,9 @@ export class FsHandler {
           }))
           this.dispatcher.notify('fs.changed', { events: mapped })
         },
-        { ignore: ['.git', 'node_modules', 'dist', 'build', '.next', '.cache', '__pycache__'] }
+        // Why: align remote-Linux watchers with the shared nested-glob exclusion
+        // so nested node_modules/.git don't exhaust inotify on large codebases.
+        { ignore: buildParcelWatcherIgnoreOption(WATCHER_IGNORE_DIRS) }
       )
       watchState.unwatchFn = () => {
         void subscription.unsubscribe()
