@@ -1387,6 +1387,9 @@ type RuntimeWorktreeRemovalTarget = {
   repoId: string
   path: string
   pushTarget?: GitPushTarget
+  // Why: set only when the exact-ID fallback accepted an id whose owning repo is
+  // gone; removal must then stay metadata-only instead of failing repo_not_found.
+  repoMissing?: boolean
 }
 
 type RuntimeWorktreeRemovalInFlight = {
@@ -15111,7 +15114,17 @@ export class OrcaRuntimeService {
       // Why: delete requests can arrive after Git no longer lists the worktree.
       // Only exact IDs with persisted Orca metadata are accepted here so
       // branch/path selectors cannot resolve to an arbitrary missing path.
-      return meta.pushTarget ? { ...removalTarget, pushTarget: meta.pushTarget } : removalTarget
+      //
+      // Why repoMissing: a repo removed while its worktree metadata survived
+      // (stale metas, GC grace, interrupted project delete) leaves rows the
+      // sidebar still renders. Without this flag removal aborts with
+      // repo_not_found and the row can never be dismissed from the UI.
+      const repoMissing = !this.store?.getRepo(removalTarget.repoId)
+      return {
+        ...removalTarget,
+        ...(meta.pushTarget ? { pushTarget: meta.pushTarget } : {}),
+        ...(repoMissing ? { repoMissing: true } : {})
+      }
     }
   }
 
@@ -15269,7 +15282,33 @@ export class OrcaRuntimeService {
     const removal = (async (): Promise<RemoveWorktreeResult & { warning?: string }> => {
       const repo = store.getRepo(removalTarget.repoId)
       if (!repo) {
-        throw new Error('repo_not_found')
+        if (removalTarget.repoMissing !== true) {
+          throw new Error('repo_not_found')
+        }
+        // Why: the owning repo is gone but its worktree metadata outlived it, so
+        // there is no Git authority, repo path, or SSH provider left to drive a
+        // real removal. Tear down this workspace's terminals and drop the
+        // Orca-only records, which is the only action that can succeed — the
+        // row exists solely because that metadata still does.
+        const localProvider = this.getLocalProvider()
+        if (localProvider) {
+          await killAllProcessesForWorktree(removalTarget.id, {
+            runtime: this,
+            localProvider,
+            onPtyStopped: this.onPtyStopped ?? undefined
+          }).catch((err) => {
+            console.warn(`[worktree-teardown] failed for ${removalTarget.id}:`, err)
+          })
+        }
+        this.clearOptimisticReconcileToken(removalTarget.id)
+        this.removeWorktreeMetadataAndHistory(store, removalTarget.id)
+        this.preservedBranchCleanupByWorktreeId.delete(removalTarget.id)
+        this.invalidateResolvedWorktreeCache()
+        invalidateAuthorizedRootsCache()
+        this.notifyWorktreesChanged(removalTarget.repoId)
+        return {
+          warning: `Removed Orca workspace records for "${removalTarget.path}" without touching disk: its project is no longer registered.`
+        }
       }
       if (isFolderRepo(repo)) {
         if (removalTarget.id === getRuntimeFolderWorkspaceRootId(repo)) {

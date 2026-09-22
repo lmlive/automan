@@ -80,6 +80,11 @@ const HEARTBEAT_PROBE_GRACE_MS = 20_000
 export class WebRuntimeClient {
   private ws: WebSocket | null = null
   private sharedKey: Uint8Array | null = null
+  // Why: session token issued by the runtime in the last e2ee_authenticated ack.
+  // Held in memory only (never localStorage) so a reconnect presents a
+  // short-lived credential instead of the long-lived pairing device token.
+  private sessionToken: string | null = null
+  private sessionTokenExpiresAt = 0
   private state: WebRuntimeConnectionState = 'disconnected'
   private requestCounter = 0
   private reconnectAttempt = 0
@@ -122,7 +127,7 @@ export class WebRuntimeClient {
         reject(new Error(`Request timed out: ${method}`))
       }, timeoutMs)
       this.pending.set(id, { method, resolve, reject, timeout })
-      if (!this.sendEncrypted({ id, deviceToken: this.pairing.deviceToken, method, params })) {
+      if (!this.sendEncrypted({ id, method, params })) {
         this.pending.delete(id)
         window.clearTimeout(timeout)
         reject(new Error('Remote Orca runtime is not connected.'))
@@ -297,7 +302,7 @@ export class WebRuntimeClient {
     await this.waitForConnected(options?.timeoutMs)
     const id = this.nextId()
     this.subscriptions.set(id, { method, params, callbacks })
-    if (!this.sendEncrypted({ id, deviceToken: this.pairing.deviceToken, method, params })) {
+    if (!this.sendEncrypted({ id, method, params })) {
       this.subscriptions.delete(id)
       throw new Error('Remote Orca runtime is not connected.')
     }
@@ -310,7 +315,6 @@ export class WebRuntimeClient {
         if (teardown) {
           this.sendEncrypted({
             id: this.nextId(),
-            deviceToken: this.pairing.deviceToken,
             method: teardown.method,
             params: teardown.params
           })
@@ -429,7 +433,15 @@ export class WebRuntimeClient {
       try {
         const control = JSON.parse(raw) as { type?: unknown }
         if (control.type === 'e2ee_ready') {
-          this.sendEncrypted({ type: 'e2ee_auth', deviceToken: this.pairing.deviceToken })
+          // Why: prefer the runtime-issued session token (short-lived); fall back
+          // to the pairing device token on first connect or once it expires, so a
+          // stale session can never wedge the client out of connecting.
+          const usableSessionToken =
+            this.sessionToken && this.sessionTokenExpiresAt > Date.now() ? this.sessionToken : null
+          this.sendEncrypted({
+            type: 'e2ee_auth',
+            token: usableSessionToken ?? this.pairing.deviceToken
+          })
           return
         }
       } catch {
@@ -443,9 +455,18 @@ export class WebRuntimeClient {
       try {
         const control = JSON.parse(plaintext) as {
           type?: unknown
+          token?: unknown
+          expiresAt?: unknown
           error?: { code?: string; message?: string }
         }
         if (control.type === 'e2ee_authenticated') {
+          // Why: remember the runtime-issued session token so the next reconnect
+          // presents it instead of the long-lived pairing device token.
+          if (typeof control.token === 'string' && control.token.length > 0) {
+            this.sessionToken = control.token
+            this.sessionTokenExpiresAt =
+              typeof control.expiresAt === 'number' ? control.expiresAt : 0
+          }
           this.clearHandshakeTimer()
           this.reconnectAttempt = 0
           this.setState('connected')
@@ -755,7 +776,6 @@ export class WebRuntimeClient {
       if (
         this.sendEncrypted({
           id: `web-heartbeat-${this.nextId()}`,
-          deviceToken: this.pairing.deviceToken,
           method: 'status.get'
         })
       ) {

@@ -3,6 +3,7 @@ import type { FsChangeEvent } from '../../shared/types'
 
 type MockWorker = {
   terminated: boolean
+  unreferenced: boolean
   postedMessages: unknown[]
   workerData: unknown
   on(event: string, listener: (arg?: unknown) => void): MockWorker
@@ -10,6 +11,8 @@ type MockWorker = {
   off(event: string, listener: (arg?: unknown) => void): MockWorker
   postMessage(message: unknown): void
   terminate(): Promise<number>
+  unref(): void
+  removeAllListeners(): MockWorker
   emit(event: string, arg?: unknown): void
   listenerCount(event: string): number
 }
@@ -18,6 +21,7 @@ const workerState = vi.hoisted(() => {
   const instances: MockWorker[] = []
   class MockWorkerImpl {
     terminated = false
+    unreferenced = false
     postedMessages: unknown[] = []
     workerData: unknown
     private listeners = new Map<string, { listener: (arg?: unknown) => void; once: boolean }[]>()
@@ -59,6 +63,15 @@ const workerState = vi.hoisted(() => {
       return 0
     }
 
+    unref(): void {
+      this.unreferenced = true
+    }
+
+    removeAllListeners(): this {
+      this.listeners.clear()
+      return this
+    }
+
     emit(event: string, arg?: unknown): void {
       const entries = this.listeners.get(event)?.slice() ?? []
       for (const entry of entries) {
@@ -84,7 +97,7 @@ vi.mock('worker_threads', () => ({
   Worker: workerState.MockWorkerImpl
 }))
 
-import { watchFileExplorerInWorker } from './file-watcher-host'
+import { WORKER_TEARDOWN_TIMEOUT_MS, watchFileExplorerInWorker } from './file-watcher-host'
 
 function lastWorker(): MockWorker {
   const worker = workerState.instances.at(-1)
@@ -133,7 +146,9 @@ describe('watchFileExplorerInWorker', () => {
     worker.emit('message', { type: 'error', message: 'addon missing' })
 
     await expect(promise).rejects.toThrow('addon missing')
-    expect(worker.terminated).toBe(true)
+    // Why: the crawl may still be live inside @parcel/watcher, and terminate()
+    // there aborts the whole process inside napi — abandon, never force-free.
+    expect(worker.terminated).toBe(false)
   })
 
   it('rejects if the worker exits before ready', async () => {
@@ -195,7 +210,7 @@ describe('watchFileExplorerInWorker', () => {
     expect(worker.terminated).toBe(false)
   })
 
-  it('force-terminates the worker only if it fails to exit within the timeout', async () => {
+  it('abandons a wedged worker instead of force-terminating it', async () => {
     vi.useFakeTimers()
     try {
       const promise = watchFileExplorerInWorker('/repo', vi.fn())
@@ -206,11 +221,13 @@ describe('watchFileExplorerInWorker', () => {
       const disposed = dispose()
       expect(worker.postedMessages).toContainEqual({ type: 'unsubscribe' })
       expect(worker.listenerCount('exit')).toBe(2)
-      // Worker is wedged and never emits exit: the backstop must terminate it.
-      await vi.advanceTimersByTimeAsync(10_000)
+      // Worker is wedged and never emits exit. Why: force-terminating it would
+      // free its V8 env while @parcel/watcher's native callback is still live and
+      // abort the process, so the backstop only unrefs it and warns.
+      await vi.advanceTimersByTimeAsync(WORKER_TEARDOWN_TIMEOUT_MS + 1000)
       await disposed
-      expect(worker.terminated).toBe(true)
-      expect(worker.listenerCount('exit')).toBe(1)
+      expect(worker.terminated).toBe(false)
+      expect(worker.unreferenced).toBe(true)
     } finally {
       vi.useRealTimers()
     }

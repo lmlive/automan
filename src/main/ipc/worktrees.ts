@@ -1361,7 +1361,27 @@ export function registerWorktreeHandlers(
         const { repoId, worktreePath } = parseWorktreeId(args.worktreeId)
         const repo = store.getRepo(repoId)
         if (!repo) {
-          throw new Error(`Repo not found: ${repoId}`)
+          // Why: a repo removed while its worktree metadata survived (stale
+          // metas, GC grace, interrupted project delete) leaves sidebar rows
+          // whose delete action can never succeed. Requiring persisted metadata
+          // keeps this an exact-ID metadata cleanup: no Git authority, repo path,
+          // or disk path is available or touched.
+          if (!store.getWorktreeMeta(args.worktreeId)) {
+            throw new Error(`Repo not found: ${repoId}`)
+          }
+          await killAllProcessesForWorktree(args.worktreeId, {
+            runtime,
+            localProvider: getLocalPtyProvider(),
+            onPtyStopped: clearProviderPtyState
+          }).catch((err) => {
+            console.warn(`[worktree-teardown] failed for ${args.worktreeId}:`, err)
+          })
+          runtime.clearOptimisticReconcileToken(args.worktreeId)
+          removeWorktreeMetadataAndTransientState(store, args.worktreeId)
+          preservedBranchCleanupByWorktreeId.delete(args.worktreeId)
+          invalidateAuthorizedRootsCache()
+          notifyWorktreesChanged(mainWindow, repoId)
+          return {}
         }
         if (isFolderRepo(repo)) {
           if (args.worktreeId === getFolderWorkspaceRootId(repo)) {

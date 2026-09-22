@@ -19,10 +19,11 @@ import {
 const RUNTIME_FILE_WATCH_IGNORE = buildParcelWatcherIgnoreOption(WATCHER_IGNORE_DIRS)
 
 // Why: clean teardown is async (the worker awaits subscription.unsubscribe()
-// before closing its port and exiting). Wait this long for the worker to exit on
-// its own before force-terminating, so the native watcher thread isn't freed
-// mid-flight.
-const WORKER_TEARDOWN_TIMEOUT_MS = 5000
+// before closing its port and exiting), and the worker's initial crawl can run
+// for a while under load before that unsubscribe is even serviced. Wait
+// generously so a slow-but-healthy worker is never abandoned; there is
+// deliberately NO force-terminate backstop — see abandonWorker below.
+export const WORKER_TEARDOWN_TIMEOUT_MS = 30_000
 type WorkerExitWaitResult = 'exit' | 'timeout'
 
 function getFileWatcherWorkerPath(): string {
@@ -30,6 +31,27 @@ function getFileWatcherWorkerPath(): string {
     return join(process.resourcesPath, 'app.asar', 'out', 'main', 'file-watcher-worker.js')
   }
   return join(__dirname, 'file-watcher-worker.js')
+}
+
+// Why: worker.terminate() force-frees the worker's V8 env while @parcel/watcher's
+// native watch thread / inflight async work is still live, which aborts the WHOLE
+// process inside napi (verified stack: PromiseRunner::onWorkComplete ->
+// Napi::Error::ThrowAsJavaScriptException -> node::FreeEnvironment ->
+// node::worker::Worker::Run, exit 134/SIGABRT). That happens whether the crawl
+// already went live or not, so terminate() is never safe here. Abandoning instead
+// leaks at most one worker thread when it is genuinely wedged — a bounded cost —
+// where terminating can only be taken on the main process's behalf.
+// Why no removeAllListeners(): that would also drop Node's internal worker-pipe
+// listeners, which risks faulting the addon later (observed as a general
+// protection fault inside watcher.node). The `disposed`/`ready` flags already
+// stop late worker messages from reaching this watch's callbacks.
+function abandonWorker(worker: Worker, reason: string, rootPath: string): void {
+  try {
+    worker.unref()
+  } catch {
+    // Older runtimes without unref() are still safe to leave attached.
+  }
+  console.warn('[runtime-files.watch] abandoned file watcher worker', { rootPath, reason })
 }
 
 function waitForWorkerExit(worker: Worker, timeoutMs: number): Promise<WorkerExitWaitResult> {
@@ -83,22 +105,16 @@ export function watchFileExplorerInWorker(
         return
       }
       // Ask the worker to unsubscribe its native watcher and exit on its own.
-      // Why: worker.terminate() force-frees the worker's V8 env while
-      // @parcel/watcher's native watch thread / inflight async work is still
-      // live, which faults inside napi (Watcher::findCallback,
-      // PromiseRunner::onWorkComplete). Only terminate as a backstop if the
-      // worker wedges and never exits.
+      // Why: never terminate() here — see abandonWorker.
       try {
         worker.postMessage({ type: 'unsubscribe' } satisfies FileWatcherHostMessage)
       } catch {
-        // Worker already gone — the exit wait and timeout backstop cover it.
+        // Worker already gone — the exit wait and timeout backstop cover this.
       }
       const exitResult = await waitForWorkerExit(worker, WORKER_TEARDOWN_TIMEOUT_MS)
       if (exitResult === 'timeout' && !exited) {
-        await worker.terminate().then(
-          () => undefined,
-          () => undefined
-        )
+        // Wedged: abandon rather than force-free its V8 env mid-napi-callback.
+        abandonWorker(worker, 'dispose timeout', rootPath)
       }
     }
 
@@ -124,8 +140,10 @@ export function watchFileExplorerInWorker(
       if (message.type === 'error') {
         if (!ready) {
           // The crawl never went live — fail the watch so the caller knows.
+          // Why: the crawl may still be running inside @parcel/watcher, so
+          // terminate() would abort the process; abandon instead.
           disposed = true
-          void worker.terminate()
+          abandonWorker(worker, 'error before ready', rootPath)
           reject(new Error(message.message))
           return
         }

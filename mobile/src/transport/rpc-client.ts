@@ -195,6 +195,11 @@ export function connect(
   // Why: fresh ephemeral keypair per connection provides forward secrecy.
   // The shared key is derived from our ephemeral secret + server's static public key.
   let sharedKey: Uint8Array | null = null
+  // Why: session token issued by the runtime in the last e2ee_authenticated ack.
+  // Kept for this client's lifetime (not persisted) so a reconnect presents the
+  // short-lived credential instead of the long-lived device token.
+  let sessionToken: string | null = null
+  let sessionTokenExpiresAt = 0
   const serverPublicKey = publicKeyFromBase64(serverPublicKeyB64)
 
   const pending = new Map<string, PendingRequest>()
@@ -438,7 +443,13 @@ export function connect(
           const msg = JSON.parse(raw)
           if (msg.type === 'e2ee_ready') {
             emitLog('success', 'Received e2ee_ready', 'Sending device token')
-            sendEncrypted({ type: 'e2ee_auth', deviceToken })
+            // Why: prefer the session token the runtime issued on an earlier
+            // connect (short-lived, expires on its own); fall back to the
+            // pairing's device token on a first connect or once it has expired,
+            // so a stale session can never wedge the client out of connecting.
+            const usableSessionToken =
+              sessionToken && sessionTokenExpiresAt > Date.now() ? sessionToken : null
+            sendEncrypted({ type: 'e2ee_auth', token: usableSessionToken ?? deviceToken })
             return
           }
         } catch {
@@ -460,6 +471,12 @@ export function connect(
             if (handshakeTimer) {
               clearTimeout(handshakeTimer)
               handshakeTimer = null
+            }
+            // Why: remember the runtime-issued session token so the next
+            // reconnect presents it instead of the long-lived device token.
+            if (typeof msg.token === 'string' && msg.token.length > 0) {
+              sessionToken = msg.token
+              sessionTokenExpiresAt = typeof msg.expiresAt === 'number' ? msg.expiresAt : 0
             }
             console.log('[net] e2ee_authenticated — connected', {
               streamCount: streamListeners.size
@@ -483,9 +500,7 @@ export function connect(
                 activeBrowserScreencastRequestId = null
               }
               resetTerminalStreamRoutingForRequest(id)
-              if (
-                sendEncrypted({ id, deviceToken, method: stream.method, params: stream.params })
-              ) {
+              if (sendEncrypted({ id, method: stream.method, params: stream.params })) {
                 stream.sent = true
               } else {
                 emitStreamError(stream, 'Connection interrupted')
@@ -845,7 +860,7 @@ export function connect(
         clearTimeout(timeout)
       }
     })
-    if (!sendEncrypted({ id, deviceToken, method: 'status.get' })) {
+    if (!sendEncrypted({ id, method: 'status.get' })) {
       clearTimeout(timeout)
       pending.delete(id)
     }
@@ -1000,7 +1015,6 @@ export function connect(
   function sendBrowserScreencastUnsubscribe(subscriptionId: string): void {
     sendEncrypted({
       id: nextId(),
-      deviceToken,
       method: 'browser.screencast.unsubscribe',
       params: { subscriptionId }
     })
@@ -1048,7 +1062,7 @@ export function connect(
           }
         })
 
-        if (!sendEncrypted({ id, deviceToken, method, params })) {
+        if (!sendEncrypted({ id, method, params })) {
           pending.delete(id)
           clearTimeout(timeout)
           reject(new Error('Connection interrupted'))
@@ -1085,7 +1099,7 @@ export function connect(
       }
 
       if (state === 'connected') {
-        if (sendEncrypted({ id, deviceToken, method, params })) {
+        if (sendEncrypted({ id, method, params })) {
           stream.sent = true
         } else {
           emitStreamError(stream, 'Connection interrupted')
@@ -1115,7 +1129,6 @@ export function connect(
           if (unsubscribeParams) {
             sendEncrypted({
               id: nextId(),
-              deviceToken,
               method: 'terminal.unsubscribe',
               params: unsubscribeParams
             })
@@ -1128,7 +1141,6 @@ export function connect(
         ) {
           sendEncrypted({
             id: nextId(),
-            deviceToken,
             method: 'session.tabs.unsubscribe',
             params: { worktree: (stream.params as { worktree: string }).worktree }
           })

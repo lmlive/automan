@@ -27,7 +27,10 @@ function setup(overrides?: Partial<E2EEChannelOptions>) {
 
   const channel = new E2EEChannel(ws as unknown as WebSocket, {
     serverSecretKey: serverKeys.secretKey,
-    validateToken: (token) => token === 'valid-token',
+    resolveCredential: (credential) =>
+      credential === 'valid-token'
+        ? { deviceToken: 'valid-token', deviceId: 'device-1', scope: 'mobile' }
+        : null,
     onReady,
     onError,
     ...overrides

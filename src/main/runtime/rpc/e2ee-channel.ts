@@ -3,6 +3,7 @@
 // handler only sees plaintext JSON, identical to the Unix socket path.
 import type { WebSocket } from 'ws'
 import { deriveSharedKey, encrypt, decrypt, encryptBytes, decryptBytes } from './e2ee-crypto'
+import type { DeviceScope } from '../../../shared/runtime-types'
 
 type ChannelState = 'awaiting_hello' | 'awaiting_auth' | 'ready'
 
@@ -17,12 +18,34 @@ type E2EEHello = {
 
 type E2EEAuth = {
   type: 'e2ee_auth'
+  // Why: the long-lived device token from the pairing offer. Kept for pairings
+  // created before session tokens existed.
+  deviceToken?: string
+  // Why: short-lived session token the runtime issued on an earlier connect.
+  // Either credential resolves to the same device identity.
+  token?: string
+}
+
+// Why: the resolved identity, not the presented credential. Callers key
+// connection bookkeeping (revocation, disconnect cleanup) on deviceToken, so a
+// session token must never leak into that slot.
+export type E2EEAuthenticatedIdentity = {
   deviceToken: string
+  deviceId: string
+  scope: DeviceScope
+}
+
+export type E2EEIssuedSessionToken = {
+  token: string
+  expiresAt: number
 }
 
 export type E2EEChannelOptions = {
   serverSecretKey: Uint8Array
-  validateToken: (token: string) => boolean
+  resolveCredential: (credential: string) => E2EEAuthenticatedIdentity | null
+  // Why: minting is optional so the channel stays testable without a device
+  // registry; a null result simply omits the token from the auth ack.
+  mintSessionToken?: (identity: E2EEAuthenticatedIdentity) => E2EEIssuedSessionToken | null
   onReady: (channel: E2EEChannel) => void
   onError: (code: number, reason: string) => void
 }
@@ -34,7 +57,10 @@ export class E2EEChannel {
   private handshakeTimer: ReturnType<typeof setTimeout> | null = null
   private readonly ws: WebSocket
   private readonly serverSecretKey: Uint8Array
-  private readonly validateToken: (token: string) => boolean
+  private readonly resolveCredential: (credential: string) => E2EEAuthenticatedIdentity | null
+  private readonly mintSessionToken:
+    | ((identity: E2EEAuthenticatedIdentity) => E2EEIssuedSessionToken | null)
+    | undefined
   private readonly onReady: (channel: E2EEChannel) => void
   private readonly onError: (code: number, reason: string) => void
   // Why: the RPC handler is set after the channel is ready, so the channel
@@ -49,12 +75,19 @@ export class E2EEChannel {
     | null = null
   private binaryMessageHandler: ((plaintext: Uint8Array<ArrayBufferLike>) => void) | null = null
 
+  // Why: identity of the authenticated device, resolved from whichever
+  // credential (device token or session token) the client presented. This is
+  // the device token, never the presented credential, so revocation and
+  // disconnect bookkeeping keep matching on the registry's own token.
   deviceToken: string | null = null
+  deviceId: string | null = null
+  scope: DeviceScope | null = null
 
   constructor(ws: WebSocket, options: E2EEChannelOptions) {
     this.ws = ws
     this.serverSecretKey = options.serverSecretKey
-    this.validateToken = options.validateToken
+    this.resolveCredential = options.resolveCredential
+    this.mintSessionToken = options.mintSessionToken
     this.onReady = options.onReady
     this.onError = options.onError
 
@@ -192,18 +225,25 @@ export class E2EEChannel {
       return
     }
 
-    if (auth.type !== 'e2ee_auth' || !auth.deviceToken) {
+    if (auth.type !== 'e2ee_auth') {
       this.sendEncryptedControl({ type: 'e2ee_error', error: { code: 'bad_auth' } })
       this.onError(4001, 'Invalid e2ee_auth')
       return
     }
-    if (!this.validateToken(auth.deviceToken)) {
+
+    // Why: clients may present either the pairing's device token or a session
+    // token from an earlier connect; both resolve to the same device identity.
+    const credential = auth.token ?? auth.deviceToken
+    const identity = credential ? this.resolveCredential(credential) : null
+    if (!identity) {
       this.sendEncryptedControl({ type: 'e2ee_error', error: { code: 'unauthorized' } })
       this.onError(4001, 'Unauthorized')
       return
     }
 
-    this.deviceToken = auth.deviceToken
+    this.deviceToken = identity.deviceToken
+    this.deviceId = identity.deviceId
+    this.scope = identity.scope
     this.state = 'ready'
 
     if (this.handshakeTimer) {
@@ -211,7 +251,14 @@ export class E2EEChannel {
       this.handshakeTimer = null
     }
 
-    this.sendEncryptedControl({ type: 'e2ee_authenticated' })
+    // Why: the ack carries a freshly minted session token so the client can stop
+    // replaying the long-lived device token on every reconnect. Older clients
+    // ignore the extra field, so this stays backward compatible.
+    const issued = this.mintSessionToken?.(identity) ?? null
+    this.sendEncryptedControl({
+      type: 'e2ee_authenticated',
+      ...(issued ? { token: issued.token, expiresAt: issued.expiresAt } : {})
+    })
     this.onReady(this)
   }
 

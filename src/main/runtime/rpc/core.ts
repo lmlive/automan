@@ -33,7 +33,11 @@ export type RpcResponse = RpcSuccess | RpcFailure
 
 export type RpcRequest = {
   id: string
-  authToken: string
+  // Why: only the Unix socket transport authenticates per-frame with the shared
+  // runtime token from the 0o600 metadata file. WebSocket clients authenticate
+  // once during the E2EE handshake, so their frames carry no authToken and the
+  // field must stay optional here.
+  authToken?: string
   method: string
   params?: unknown
 }

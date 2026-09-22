@@ -295,7 +295,6 @@ export async function sendRemoteRuntimeRequest<TResult>(
         encrypt(
           JSON.stringify({
             id: requestId,
-            deviceToken: pairing.deviceToken,
             method,
             params
           }),
@@ -581,7 +580,6 @@ export async function subscribeRemoteRuntimeRequest<TResult>(
         encrypt(
           JSON.stringify({
             id: requestId,
-            deviceToken: pairing.deviceToken,
             method,
             params
           }),

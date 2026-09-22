@@ -24831,6 +24831,65 @@ describe('OrcaRuntimeService', () => {
     }
   })
 
+  it('removes worktree metadata when the owning repo is no longer registered', async () => {
+    const orphanWorktreePath = '/data/web3/flashloan-arbitrage-mvp'
+    const orphanRepoId = 'bf23bed5-b2b3-4593-b947-cdce81a28965'
+    const orphanWorktreeId = `${orphanRepoId}::${orphanWorktreePath}`
+    const metaById: Record<string, WorktreeMeta> = {
+      [orphanWorktreeId]: makeWorktreeMeta()
+    }
+    const removeWorktreeMeta = vi.fn((id: string) => {
+      delete metaById[id]
+    })
+    const runtimeStore = {
+      ...store,
+      // Why: the repo row is gone while its worktree metadata survived, which is
+      // exactly the state that made delete fail with repo_not_found.
+      getRepos: () => [],
+      getAllWorktreeMeta: () => metaById,
+      getWorktreeMeta: (id: string) => metaById[id],
+      removeWorktreeMeta
+    }
+    const runtime = new OrcaRuntimeService(runtimeStore as never)
+    const gitSpy = vi.spyOn(gitRunner, 'gitExecFileAsync').mockResolvedValue({
+      stdout: '',
+      stderr: ''
+    })
+
+    try {
+      const result = await runtime.removeManagedWorktree(orphanWorktreeId, true)
+
+      expect(removeWorktreeMeta).toHaveBeenCalledWith(orphanWorktreeId)
+      expect(metaById[orphanWorktreeId]).toBeUndefined()
+      expect(result.warning).toContain(orphanWorktreePath)
+      // Why: no repo means no Git authority and no disk path to act on, so the
+      // cleanup must stay metadata-only.
+      expect(gitSpy).not.toHaveBeenCalled()
+      expect(removeWorktree).not.toHaveBeenCalled()
+    } finally {
+      gitSpy.mockRestore()
+    }
+  })
+
+  it('still rejects an exact-ID delete for an unknown worktree whose repo is gone', async () => {
+    const orphanRepoId = 'bf23bed5-b2b3-4593-b947-cdce81a28965'
+    const unknownWorktreeId = `${orphanRepoId}::/data/web3/never-registered`
+    const runtimeStore = {
+      ...store,
+      getRepos: () => [],
+      getAllWorktreeMeta: () => ({}),
+      getWorktreeMeta: () => undefined,
+      removeWorktreeMeta: vi.fn()
+    }
+    const runtime = new OrcaRuntimeService(runtimeStore as never)
+
+    // Why: the metadata gate is what keeps this from becoming a way to delete
+    // arbitrary paths by inventing a repo id.
+    await expect(runtime.removeManagedWorktree(unknownWorktreeId, true)).rejects.toThrow(
+      'selector_not_found'
+    )
+  })
+
   it('keeps runtime metadata when long-path recovery deletes the directory but prune fails', async () => {
     setPlatform('win32')
     const removeWorktreeMeta = vi.fn()

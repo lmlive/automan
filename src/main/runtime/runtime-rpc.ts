@@ -19,7 +19,12 @@ import { WebSocketTransport } from './rpc/ws-transport'
 import type { WebSocket } from 'ws'
 import { DeviceRegistry, type DeviceScope } from './device-registry'
 import { loadOrCreateE2EEKeypair, type E2EEKeypair } from './e2ee-keypair'
-import { E2EEChannel } from './rpc/e2ee-channel'
+import {
+  E2EEChannel,
+  type E2EEAuthenticatedIdentity,
+  type E2EEIssuedSessionToken
+} from './rpc/e2ee-channel'
+import { isSessionTokenShaped, signSessionToken, verifySessionToken } from '../auth/jwt'
 import { encodePairingOffer, PAIRING_OFFER_VERSION } from '../../shared/pairing'
 import {
   decodeTerminalStreamFrame,
@@ -463,6 +468,52 @@ export class OrcaRuntimeRpcServer {
     return this.e2eeKeypair
   }
 
+  // Why: a WebSocket client authenticates with either the pairing's device token
+  // or a session token from a prior connect. Both must resolve to the registry's
+  // own device token so that revocation (terminateClientConnections) and
+  // disconnect cleanup keep keying on a value the registry can still match.
+  private resolveCredential(credential: string): E2EEAuthenticatedIdentity | null {
+    const registry = this.deviceRegistry
+    if (!registry) {
+      return null
+    }
+
+    if (isSessionTokenShaped(credential)) {
+      const claims = verifySessionToken({ userDataPath: this.userDataPath, token: credential })
+      if (!claims) {
+        return null
+      }
+      // Why: re-read the registry instead of trusting the token's own scope, so
+      // a revoked device loses access immediately rather than at token expiry.
+      const device = registry.getDevice(claims.sub)
+      if (!device || device.scope !== claims.role) {
+        return null
+      }
+      return { deviceToken: device.token, deviceId: device.deviceId, scope: device.scope }
+    }
+
+    const device = registry.validateToken(credential)
+    if (!device) {
+      return null
+    }
+    return { deviceToken: device.token, deviceId: device.deviceId, scope: device.scope }
+  }
+
+  private mintSessionToken(identity: E2EEAuthenticatedIdentity): E2EEIssuedSessionToken | null {
+    try {
+      const { token, expiresAt } = signSessionToken({
+        userDataPath: this.userDataPath,
+        deviceId: identity.deviceId,
+        scope: identity.scope
+      })
+      return { token, expiresAt }
+    } catch {
+      // Why: token issuance is an optimization over the device token the client
+      // already holds, so a signing failure must not break the handshake.
+      return null
+    }
+  }
+
   revokeMobileDevice(deviceId: string): boolean {
     const device = this.deviceRegistry?.getDevice(deviceId)
     if (device?.scope !== 'mobile' || !this.deviceRegistry?.removeDevice(deviceId)) {
@@ -717,7 +768,8 @@ export class OrcaRuntimeRpcServer {
             this.wsConnectionIds.set(ws, randomBytes(8).toString('hex'))
             channel = new E2EEChannel(ws, {
               serverSecretKey: this.e2eeKeypair!.secretKey,
-              validateToken: (token) => this.deviceRegistry?.validateToken(token) != null,
+              resolveCredential: (credential) => this.resolveCredential(credential),
+              mintSessionToken: (identity) => this.mintSessionToken(identity),
               onReady: (ch) => {
                 if (ch.deviceToken) {
                   wsTransport.setClientId(ws, ch.deviceToken)
@@ -941,8 +993,9 @@ export class OrcaRuntimeRpcServer {
       reply(JSON.stringify(this.buildError(request.id, 'unauthorized', 'Device token mismatch')))
       return
     }
-    // Why: E2EE already authenticated the WebSocket channel. Use that bound
-    // identity for authorization instead of trusting a repeated request field.
+    // Why: E2EE already authenticated the WebSocket channel, and the channel
+    // normalizes either credential to the registry's own device token. Use that
+    // bound identity for authorization instead of trusting a repeated field.
     const token = authenticatedDeviceToken ?? requestToken
     if (!token) {
       reply(JSON.stringify(this.buildError(request.id, 'unauthorized', 'Missing device token')))

@@ -15,6 +15,7 @@ import { createRuntimeTransportMetadata, OrcaRuntimeRpcServer } from './runtime-
 import { parsePairingCode } from '../../shared/pairing'
 import { decrypt, deriveSharedKey, encrypt, generateKeyPair } from './rpc/e2ee-crypto'
 import { DeviceRegistry } from './device-registry'
+import { signSessionToken } from '../auth/jwt'
 
 vi.mock('../git/worktree', () => ({
   listWorktrees: vi.fn().mockResolvedValue([
@@ -149,6 +150,9 @@ function waitForWsClose(ws: WebSocket): Promise<void> {
 type AuthenticatedMobileWs = {
   ws: WebSocket
   sharedKey: Uint8Array
+  // Why: the runtime issues a session token in the auth ack; tests need it to
+  // exercise the reconnect path that presents the token instead of deviceToken.
+  sessionToken: string | null
 }
 
 async function authenticateMobileWsSession(pairingUrl: string): Promise<AuthenticatedMobileWs> {
@@ -170,11 +174,41 @@ async function authenticateMobileWsSession(pairingUrl: string): Promise<Authenti
   ws.send(
     encrypt(JSON.stringify({ type: 'e2ee_auth', deviceToken: parsed!.deviceToken }), sharedKey)
   )
-  expect(JSON.parse(decrypt(await nextWsMessage(ws), sharedKey)!)).toEqual({
-    type: 'e2ee_authenticated'
-  })
+  const authenticated = JSON.parse(decrypt(await nextWsMessage(ws), sharedKey)!)
+  // Why: the ack carries a freshly minted session token alongside the type.
+  expect(authenticated).toMatchObject({ type: 'e2ee_authenticated' })
+  expect(typeof authenticated.token).toBe('string')
+  expect(typeof authenticated.expiresAt).toBe('number')
 
-  return { ws, sharedKey }
+  return { ws, sharedKey, sessionToken: authenticated.token as string }
+}
+
+// Why: reconnects present the session token from the previous ack rather than
+// the long-lived device token, so the server must accept it on a fresh socket.
+async function authenticateWithSessionToken(
+  pairingUrl: string,
+  sessionToken: string
+): Promise<AuthenticatedMobileWs> {
+  const parsed = parsePairingCode(pairingUrl)
+  expect(parsed).toBeTruthy()
+  const ws = await connectWs(parsed!.endpoint)
+  const mobileKeys = generateKeyPair()
+  const serverPublicKey = Uint8Array.from(Buffer.from(parsed!.publicKeyB64, 'base64'))
+  const sharedKey = deriveSharedKey(mobileKeys.secretKey, serverPublicKey)
+
+  ws.send(
+    JSON.stringify({
+      type: 'e2ee_hello',
+      publicKeyB64: Buffer.from(mobileKeys.publicKey).toString('base64')
+    })
+  )
+  expect(JSON.parse(await nextWsMessage(ws))).toEqual({ type: 'e2ee_ready' })
+
+  ws.send(encrypt(JSON.stringify({ type: 'e2ee_auth', token: sessionToken }), sharedKey))
+  const authenticated = JSON.parse(decrypt(await nextWsMessage(ws), sharedKey)!)
+  expect(authenticated).toMatchObject({ type: 'e2ee_authenticated' })
+
+  return { ws, sharedKey, sessionToken: authenticated.token as string }
 }
 
 async function authenticateMobileWs(pairingUrl: string): Promise<WebSocket> {
@@ -632,6 +666,165 @@ describe('OrcaRuntimeRpcServer', () => {
       await waitFor(() => server['e2eeChannels'].size === 0 && server['wsConnectionIds'].size === 0)
 
       expect(server.getDeviceRegistry()?.getDevice(offer.deviceId)).toBeNull()
+    } finally {
+      await server.stop()
+    }
+  }, 15_000)
+
+  it('accepts a session token issued by a previous connect and still reports the device scope', async () => {
+    const userDataPath = mkdtempSync(join(tmpdir(), 'orca-runtime-rpc-'))
+    const runtime = new OrcaRuntimeService()
+    const server = new OrcaRuntimeRpcServer({
+      runtime,
+      userDataPath,
+      enableWebSocket: true,
+      wsPort: 0
+    })
+
+    await server.start()
+
+    try {
+      const offer = server.createPairingOffer({
+        address: '127.0.0.1',
+        name: 'mobile-test',
+        scope: 'mobile'
+      })
+      expect(offer.available).toBe(true)
+      if (!offer.available) {
+        throw new Error('WebSocket pairing unavailable')
+      }
+
+      const first = await authenticateMobileWsSession(offer.pairingUrl)
+      first.ws.close()
+      await waitForWsClose(first.ws)
+
+      // Reconnect presenting only the session token, as a real client does.
+      const second = await authenticateWithSessionToken(offer.pairingUrl, first.sessionToken!)
+
+      // Why: the session token must resolve to the same device, otherwise
+      // mobile method allowlisting and scope stamping would silently break.
+      const reader = createEncryptedWsResponseReader(second)
+      try {
+        sendEncryptedWsRequest(second, { id: 'req_status', method: 'status.get' })
+        const response = await reader.next('req_status')
+        expect(response).toMatchObject({ ok: true })
+        expect((response.result as Record<string, unknown>).deviceScope).toBe('mobile')
+      } finally {
+        reader.dispose()
+      }
+
+      second.ws.close()
+      await waitForWsClose(second.ws)
+    } finally {
+      await server.stop()
+    }
+  }, 15_000)
+
+  it('refuses a session token whose device was revoked', async () => {
+    const userDataPath = mkdtempSync(join(tmpdir(), 'orca-runtime-rpc-'))
+    const runtime = new OrcaRuntimeService()
+    const server = new OrcaRuntimeRpcServer({
+      runtime,
+      userDataPath,
+      enableWebSocket: true,
+      wsPort: 0
+    })
+
+    await server.start()
+
+    try {
+      const offer = server.createPairingOffer({
+        address: '127.0.0.1',
+        name: 'mobile-test',
+        scope: 'mobile'
+      })
+      expect(offer.available).toBe(true)
+      if (!offer.available) {
+        throw new Error('WebSocket pairing unavailable')
+      }
+
+      const session = await authenticateMobileWsSession(offer.pairingUrl)
+      const token = session.sessionToken!
+      session.ws.close()
+      await waitForWsClose(session.ws)
+
+      // Revoking drops the device from the registry; the token is still
+      // cryptographically valid, so only the registry re-read can reject it.
+      expect(server.revokeMobileDevice(offer.deviceId)).toBe(true)
+
+      const parsed = parsePairingCode(offer.pairingUrl)!
+      const ws = await connectWs(parsed.endpoint)
+      const mobileKeys = generateKeyPair()
+      const serverPublicKey = Uint8Array.from(Buffer.from(parsed.publicKeyB64, 'base64'))
+      const sharedKey = deriveSharedKey(mobileKeys.secretKey, serverPublicKey)
+
+      ws.send(
+        JSON.stringify({
+          type: 'e2ee_hello',
+          publicKeyB64: Buffer.from(mobileKeys.publicKey).toString('base64')
+        })
+      )
+      expect(JSON.parse(await nextWsMessage(ws))).toEqual({ type: 'e2ee_ready' })
+      ws.send(encrypt(JSON.stringify({ type: 'e2ee_auth', token }), sharedKey))
+
+      const rejected = JSON.parse(decrypt(await nextWsMessage(ws), sharedKey)!)
+      expect(rejected).toMatchObject({ type: 'e2ee_error', error: { code: 'unauthorized' } })
+      await waitForWsClose(ws)
+    } finally {
+      await server.stop()
+    }
+  }, 15_000)
+
+  it('refuses a session token signed for a different device scope', async () => {
+    const userDataPath = mkdtempSync(join(tmpdir(), 'orca-runtime-rpc-'))
+    const runtime = new OrcaRuntimeService()
+    const server = new OrcaRuntimeRpcServer({
+      runtime,
+      userDataPath,
+      enableWebSocket: true,
+      wsPort: 0
+    })
+
+    await server.start()
+
+    try {
+      const offer = server.createPairingOffer({
+        address: '127.0.0.1',
+        name: 'mobile-test',
+        scope: 'mobile'
+      })
+      expect(offer.available).toBe(true)
+      if (!offer.available) {
+        throw new Error('WebSocket pairing unavailable')
+      }
+
+      // Why: mint a runtime-scoped token for a mobile device. The signature is
+      // valid, so only the scope cross-check against the registry can catch it —
+      // without it a phone could escalate to the full runtime surface.
+      const forged = signSessionToken({
+        userDataPath,
+        deviceId: offer.deviceId,
+        scope: 'runtime'
+      }).token
+
+      const parsed = parsePairingCode(offer.pairingUrl)!
+      const ws = await connectWs(parsed.endpoint)
+      const mobileKeys = generateKeyPair()
+      const serverPublicKey = Uint8Array.from(Buffer.from(parsed.publicKeyB64, 'base64'))
+      const sharedKey = deriveSharedKey(mobileKeys.secretKey, serverPublicKey)
+
+      ws.send(
+        JSON.stringify({
+          type: 'e2ee_hello',
+          publicKeyB64: Buffer.from(mobileKeys.publicKey).toString('base64')
+        })
+      )
+      expect(JSON.parse(await nextWsMessage(ws))).toEqual({ type: 'e2ee_ready' })
+      ws.send(encrypt(JSON.stringify({ type: 'e2ee_auth', token: forged }), sharedKey))
+
+      const rejected = JSON.parse(decrypt(await nextWsMessage(ws), sharedKey)!)
+      expect(rejected).toMatchObject({ type: 'e2ee_error', error: { code: 'unauthorized' } })
+      await waitForWsClose(ws)
     } finally {
       await server.stop()
     }

@@ -2,7 +2,9 @@ import { z } from 'zod'
 
 export type RpcRequest = {
   id: string
-  deviceToken: string
+  // Why: WebSocket clients authenticate once in the E2EE handshake, so request
+  // frames carry no credential. Only the Unix socket path sends authToken.
+  authToken?: string
   method: string
   params?: unknown
 }

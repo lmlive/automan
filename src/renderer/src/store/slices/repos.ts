@@ -79,6 +79,7 @@ import {
 import { cleanupEphemeralVmRuntimesForDeleted } from '@/lib/ephemeral-vm-runtime-cleanup'
 import { folderWorkspaceKey, parseWorkspaceKey } from '../../../../shared/workspace-scope'
 import { formatFolderWorkspaceCreateError } from '../../lib/folder-workspace-path-status'
+import { isWebClientLocation } from '../../lib/web-client-location'
 
 const ERROR_TOAST_DURATION = 60_000
 const SAFE_AUTO_FORK_SYNC_COOLDOWN_MS = 10 * 60 * 1000
@@ -1038,6 +1039,17 @@ async function listRuntimeEnvironmentsForAllHostLoad(): Promise<{ id: string }[]
   }
 }
 
+// Why: a paired web client is a browser tab with no Orca host behind it, so its
+// `window.api` catalog calls proxy to the paired runtime. Running the "local"
+// pass there re-lists that same runtime's repos/projects/worktrees and stamps
+// the duplicates `local`; the sidebar then shows every workspace twice, and the
+// owner selectors resolve the first matching id — the local-stamped copy — so
+// terminals route to the absent local host and fail with "Local PTYs are
+// unavailable in the web client". Desktop Electron keeps its real local host.
+function hasLocalCatalogToLoad(): boolean {
+  return !isWebClientLocation()
+}
+
 function settingsForRepoOwner(state: Pick<AppState, 'repos' | 'settings'>, repoId: string) {
   const repo = findRepoForHost(state.repos, repoId, { settings: state.settings })
   if (!repo) {
@@ -1268,6 +1280,8 @@ export type RepoSlice = {
   activeRepoId: string | null
   // Monotonic sequence so an overlapping fetchRepos can drop its own stale result (#7020).
   reposFetchGeneration: number
+  projectGroupsFetchGeneration: number
+  folderWorkspacesFetchGeneration: number
   fetchRepos: () => Promise<void>
   fetchReposForAllHosts: (options?: AllHostCatalogFetchOptions) => Promise<void>
   fetchRuntimeEnvironmentRepos: (environmentId: string) => Promise<Repo[]>
@@ -1387,6 +1401,8 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
   folderWorkspacePathStatuses: {},
   activeRepoId: null,
   reposFetchGeneration: 0,
+  projectGroupsFetchGeneration: 0,
+  folderWorkspacesFetchGeneration: 0,
 
   fetchRepos: async () => {
     // Why: overlapping repos:changed fetches can resolve out of order; an earlier
@@ -1533,13 +1549,19 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
 
     // Local first so local repos are present even if a remote fetch stalls.
     let failed = false
-    try {
-      applyCatalog(await fetchRepoCatalogForTarget({ kind: 'local' }))
-    } catch (err) {
-      failed = true
-      console.error('Failed to fetch local repos for all-host load:', err)
+    const hasLocalCatalog = hasLocalCatalogToLoad()
+    if (hasLocalCatalog) {
+      try {
+        applyCatalog(await fetchRepoCatalogForTarget({ kind: 'local' }))
+      } catch (err) {
+        failed = true
+        console.error('Failed to fetch local repos for all-host load:', err)
+      }
     }
-    if (options?.remoteHosts === 'skip') {
+    // Why: the 'skip' fast path exists so first paint does not wait on a slow
+    // remote. A web client has no local catalog to paint from, so skipping the
+    // remote here would render an empty sidebar until the post-hydration refresh.
+    if (options?.remoteHosts === 'skip' && hasLocalCatalog) {
       return
     }
 
@@ -1570,9 +1592,17 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
   },
 
   fetchProjectGroups: async () => {
+    let generation = 0
+    set((s) => {
+      generation = (s.projectGroupsFetchGeneration || 0) + 1
+      return { projectGroupsFetchGeneration: generation }
+    })
     try {
       const target = getActiveRuntimeTarget(get().settings)
       const { projectGroups } = await fetchProjectGroupsForTarget(target, [])
+      if (get().projectGroupsFetchGeneration !== generation) {
+        return
+      }
       set({
         projectGroups,
         folderWorkspacePathStatuses: {}
@@ -1585,7 +1615,15 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
   fetchProjectGroupsForAllHosts: async (options) => {
     // Why: startup renders an all-host sidebar; replacing groups with only the
     // active host would leave repos from other hosts visible but ungrouped.
+    let generation = 0
+    set((s) => {
+      generation = (s.projectGroupsFetchGeneration || 0) + 1
+      return { projectGroupsFetchGeneration: generation }
+    })
     const applyCatalog = (catalog: FetchedProjectGroupCatalog): void => {
+      if (get().projectGroupsFetchGeneration !== generation) {
+        return
+      }
       set((s) => ({
         projectGroups: mergeFetchedProjectGroupCatalog(catalog, s.projectGroups).projectGroups,
         folderWorkspacePathStatuses: {}
@@ -1593,11 +1631,13 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
     }
 
     try {
-      applyCatalog(await fetchProjectGroupCatalogForTarget({ kind: 'local' }))
+      if (hasLocalCatalogToLoad()) {
+        applyCatalog(await fetchProjectGroupCatalogForTarget({ kind: 'local' }))
+      }
     } catch (err) {
       console.error('Failed to fetch local project groups for all-host load:', err)
     }
-    if (options?.remoteHosts === 'skip') {
+    if (options?.remoteHosts === 'skip' && hasLocalCatalogToLoad()) {
       return
     }
 
@@ -1619,6 +1659,11 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
   },
 
   fetchFolderWorkspaces: async () => {
+    let generation = 0
+    set((s) => {
+      generation = (s.folderWorkspacesFetchGeneration || 0) + 1
+      return { folderWorkspacesFetchGeneration: generation }
+    })
     try {
       const target = getActiveRuntimeTarget(get().settings)
       const { folderWorkspaces } = await fetchFolderWorkspacesForTarget(
@@ -1626,6 +1671,9 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
         [],
         get().projectGroups
       )
+      if (get().folderWorkspacesFetchGeneration !== generation) {
+        return
+      }
       set({ folderWorkspaces, folderWorkspacePathStatuses: {} })
     } catch (err) {
       console.error('Failed to fetch folder workspaces:', err)
@@ -1635,7 +1683,15 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
   fetchFolderWorkspacesForAllHosts: async (options) => {
     // Why: folder workspaces are owned through their project groups, so startup
     // must fetch groups first and then merge each host's folder slice.
+    let generation = 0
+    set((s) => {
+      generation = (s.folderWorkspacesFetchGeneration || 0) + 1
+      return { folderWorkspacesFetchGeneration: generation }
+    })
     const applyCatalog = (catalog: FetchedFolderWorkspaceCatalog): void => {
+      if (get().folderWorkspacesFetchGeneration !== generation) {
+        return
+      }
       set((s) => ({
         folderWorkspaces: mergeFetchedFolderWorkspaceCatalog(
           catalog,
@@ -1647,13 +1703,16 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
     }
 
     let failed = false
-    try {
-      applyCatalog(await fetchFolderWorkspaceCatalogForTarget({ kind: 'local' }))
-    } catch (err) {
-      failed = true
-      console.error('Failed to fetch local folder workspaces for all-host load:', err)
+    const hasLocalCatalog = hasLocalCatalogToLoad()
+    if (hasLocalCatalog) {
+      try {
+        applyCatalog(await fetchFolderWorkspaceCatalogForTarget({ kind: 'local' }))
+      } catch (err) {
+        failed = true
+        console.error('Failed to fetch local folder workspaces for all-host load:', err)
+      }
     }
-    if (options?.remoteHosts === 'skip') {
+    if (options?.remoteHosts === 'skip' && hasLocalCatalog) {
       return
     }
 
@@ -1847,6 +1906,7 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
       const ownedGroup = projectGroupWithFetchedOwner(group, target)
       set((s) => ({
         projectGroups: [...s.projectGroups, ownedGroup],
+        projectGroupsFetchGeneration: (s.projectGroupsFetchGeneration || 0) + 1,
         folderWorkspacePathStatuses: {}
       }))
       return ownedGroup
@@ -1874,6 +1934,7 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
             ).folderWorkspace
       set((s) => ({
         folderWorkspaces: [workspace, ...s.folderWorkspaces],
+        folderWorkspacesFetchGeneration: (s.folderWorkspacesFetchGeneration || 0) + 1,
         folderWorkspacePathStatuses: {}
       }))
       return workspace
@@ -1905,6 +1966,7 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
         folderWorkspaces: s.folderWorkspaces.map((workspace) =>
           workspace.id === folderWorkspaceId ? updated : workspace
         ),
+        folderWorkspacesFetchGeneration: (s.folderWorkspacesFetchGeneration || 0) + 1,
         folderWorkspacePathStatuses: {}
       }))
       return true
@@ -1936,6 +1998,7 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
         folderWorkspaces: s.folderWorkspaces.filter(
           (workspace) => workspace.id !== folderWorkspaceId
         ),
+        folderWorkspacesFetchGeneration: (s.folderWorkspacesFetchGeneration || 0) + 1,
         folderWorkspacePathStatuses: {}
       }))
       get().purgeWorktreeTerminalState([workspaceKey])
@@ -1968,6 +2031,7 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
       const ownedGroup = projectGroupWithFetchedOwner(updated, target)
       set((s) => ({
         projectGroups: s.projectGroups.map((group) => (group.id === groupId ? ownedGroup : group)),
+        projectGroupsFetchGeneration: (s.projectGroupsFetchGeneration || 0) + 1,
         folderWorkspacePathStatuses: {}
       }))
       return true
@@ -2007,6 +2071,8 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
               ? { ...repo, projectGroupId: null }
               : repo
           ),
+          projectGroupsFetchGeneration: (s.projectGroupsFetchGeneration || 0) + 1,
+          folderWorkspacesFetchGeneration: (s.folderWorkspacesFetchGeneration || 0) + 1,
           folderWorkspacePathStatuses: {}
         }
       })
@@ -2201,6 +2267,7 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
         const hostId = getRepoExecutionHostId(repo)
         return {
           repos: nextRepos,
+          reposFetchGeneration: (s.reposFetchGeneration || 0) + 1,
           ...mergeProjectCompatibilityForHostRepoChange({
             previous: { projects: s.projects, projectHostSetups: s.projectHostSetups },
             nextRepos,
@@ -2681,6 +2748,7 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
         const removedRepoIds = s.repos.filter((r) => !survivingRepoIds.has(r.id)).map((r) => r.id)
         return {
           repos: nextRepos,
+          reposFetchGeneration: (s.reposFetchGeneration || 0) + 1,
           // Why: drop the removed repos' sparse-preset maps so they don't outlive
           // the repo for the renderer's whole session.
           ...omitSparsePresetsForRepos(s, removedRepoIds),
@@ -2833,6 +2901,7 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
           })
           return {
             repos: nextRepos,
+            reposFetchGeneration: (s.reposFetchGeneration || 0) + 1,
             ...mergeProjectCompatibilityForHostRepoChange({
               previous: { projects: s.projects, projectHostSetups: s.projectHostSetups },
               nextRepos,
@@ -2895,6 +2964,7 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
     }
     set({
       repos: next,
+      reposFetchGeneration: (get().reposFetchGeneration || 0) + 1,
       folderWorkspacePathStatuses: {}
     })
     try {

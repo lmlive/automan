@@ -119,3 +119,8 @@ src/renderer/src/i18n/locales/.zh-catalog-cache.json
 src/renderer/src/i18n/locales/.ko-catalog-cache.json
 src/renderer/src/i18n/locales/.ja-catalog-cache.json
 src/renderer/src/i18n/locales/.es-catalog-cache.json
+
+# Local Orca runtime artifacts (machine-local, generated at serve time)
+.pairing-code.txt
+/Orca
+

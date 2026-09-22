@@ -70,6 +70,33 @@ async function mapWithConcurrency<T, R>(
 }
 
 async function main(): Promise<void> {
+  // Why: @parcel/watcher's subscribe() only resolves after the initial recursive
+  // crawl finishes, and the host's unsubscribe can arrive during that window. The
+  // message port drops messages that have no listener yet, so a mid-crawl
+  // unsubscribe used to be lost: the worker finished the crawl and stayed a live
+  // watcher forever, the host hit its 5s teardown timeout, and the abandoned
+  // worker's native watcher could later fault inside the addon (general protection
+  // fault in watcher.node) — killing the whole process. Buffer the request here
+  // and honor it as soon as the subscription exists.
+  let unsubscribeRequested = false
+  let subscription: Awaited<ReturnType<typeof ParcelWatcher.subscribe>> | null = null
+
+  const unsubscribeAndClose = (): Promise<void> =>
+    subscription!.unsubscribe().finally(() => {
+      port.close()
+    })
+
+  port.on('message', (message: FileWatcherHostMessage) => {
+    if (message.type !== 'unsubscribe') {
+      return
+    }
+    if (subscription) {
+      void unsubscribeAndClose()
+      return
+    }
+    unsubscribeRequested = true
+  })
+
   let watcher: typeof ParcelWatcher
   try {
     watcher = await import('@parcel/watcher')
@@ -78,10 +105,11 @@ async function main(): Promise<void> {
       type: 'error',
       message: err instanceof Error ? err.message : String(err)
     } satisfies FileWatcherWorkerMessage)
+    port.close()
     return
   }
 
-  const subscription = await watcher.subscribe(
+  subscription = await watcher.subscribe(
     data.rootPath,
     (err, events) => {
       if (err) {
@@ -121,15 +149,13 @@ async function main(): Promise<void> {
   )
 
   // The crawl finished and the subscription is live.
+  if (unsubscribeRequested) {
+    // Why: the host already asked to tear down while the crawl was running. Honor
+    // it now instead of announcing ready, so no orphaned native watcher survives.
+    await unsubscribeAndClose()
+    return
+  }
   port.postMessage({ type: 'ready' } satisfies FileWatcherWorkerMessage)
-
-  port.on('message', (message: FileWatcherHostMessage) => {
-    if (message.type === 'unsubscribe') {
-      void subscription.unsubscribe().finally(() => {
-        port.close()
-      })
-    }
-  })
 }
 
 void main().catch((err: unknown) => {

@@ -40,7 +40,7 @@ xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
   "$SCRIPT_DIR/out/main/index.js" \
   --serve --serve-port "$ORCA_SERVE_PORT" --serve-json \
   "${EXTRA_ARGS[@]}" \
-  > /tmp/orca-server.json 2>/dev/null &
+  > /tmp/orca-server.json 2> /tmp/orca-server-err.log &
 ORCA_PID=$!
 CLEANUP_PIDS+=("$ORCA_PID")
 
@@ -84,7 +84,7 @@ else:
 
 echo ""
 echo "[web] Starting HTTP server for web client on http://0.0.0.0:${WEB_SERVE_PORT}..."
-python3 -m http.server "$WEB_SERVE_PORT" --directory "$SCRIPT_DIR/out/web" &
+python3 "$SCRIPT_DIR/start-orca-web-http.py" "$WEB_SERVE_PORT" "$SCRIPT_DIR/out/web" &
 HTTP_PID=$!
 CLEANUP_PIDS+=("$HTTP_PID")
 sleep 0.5
