@@ -15,6 +15,7 @@ type RuntimePairingGeneratorFormProps = {
   isGeneratingPairing: boolean
   webClientUrl: string | null
   runtimePairingUrl: string | null
+  runtimePairingToken: string | null
   copiedTarget: 'web' | 'pairing' | null
   onSelectedAddressChange: (address: string) => void
   onRefreshNetworkInterfaces: () => void
@@ -30,6 +31,7 @@ export function RuntimePairingGeneratorForm({
   isGeneratingPairing,
   webClientUrl,
   runtimePairingUrl,
+  runtimePairingToken,
   copiedTarget,
   onSelectedAddressChange,
   onRefreshNetworkInterfaces,
@@ -165,7 +167,7 @@ export function RuntimePairingGeneratorForm({
             {isGeneratingPairing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
             {translate(
               'auto.components.settings.RuntimePairingUrlGenerator.8de0f84fff',
-              'Generate Access Link'
+              'Generate Access Token'
             )}
           </Button>
         </div>
@@ -198,19 +200,19 @@ export function RuntimePairingGeneratorForm({
         />
       ) : null}
 
-      {runtimePairingUrl ? (
+      {runtimePairingToken ? (
         <GeneratedUrlRow
           label={translate(
-            'auto.components.settings.RuntimePairingUrlGenerator.2e5c4e3c93',
-            'Pair another Orca client'
+            'auto.components.settings.RuntimePairingUrlGenerator.accessToken',
+            'Access token'
           )}
           description={translate(
-            'auto.components.settings.RuntimePairingUrlGenerator.849825e829',
-            'Paste this pairing URL into another Orca client.'
+            'auto.components.settings.RuntimePairingUrlGenerator.tokenDescription',
+            'Enter this token with the selected server address in another Orca client.'
           )}
-          value={runtimePairingUrl}
+          value={runtimePairingToken}
           copied={copiedTarget === 'pairing'}
-          onCopy={() => onCopy('pairing', runtimePairingUrl)}
+          onCopy={() => onCopy('pairing', runtimePairingToken)}
         />
       ) : null}
     </>

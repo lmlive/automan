@@ -1,6 +1,7 @@
 /* eslint-disable max-lines -- Why: the web preload adapter is the browser-side
    replacement for Electron preload, so the compatibility surface is necessarily
    centralized at this boundary. */
+import QRCode from 'qrcode'
 import type {
   PreloadApi,
   PreflightStatus,
@@ -46,7 +47,6 @@ import {
 } from '../../../shared/constants'
 import { legacyBaseRefSearchResult } from '../../../shared/base-ref-search-result'
 import { createE2EConfig } from '../../../shared/e2e-config'
-import { relativePathInsideRoot } from '../../../shared/cross-platform-path'
 import { LOCAL_EXECUTION_HOST_ID, normalizeExecutionHostId } from '../../../shared/execution-host'
 import { toRuntimeWorktreeSelector } from '../runtime/runtime-worktree-selector'
 import { normalizeDisabledTuiAgents } from '../../../shared/tui-agent-selection'
@@ -73,18 +73,33 @@ import {
   type KeybindingPlatform
 } from '../../../shared/keybindings'
 import {
-  clearStoredWebRuntimeEnvironment,
-  createStoredWebRuntimeEnvironment,
-  getPreferredWebPairingOffer,
-  readStoredWebRuntimeEnvironment,
   redactStoredWebRuntimeEnvironment,
-  saveStoredWebRuntimeEnvironment,
-  updateStoredEnvironmentRuntimeId,
   type StoredWebRuntimeEnvironment
 } from './web-runtime-environment'
-import { parseWebPairingInput } from './web-pairing'
-import { WebRuntimeClient } from './web-runtime-client'
-import { RuntimeRpcCallQueuePool } from '../../../shared/runtime-rpc-call-queue'
+import {
+  addWebRuntimeEnvironmentFromPairingCode,
+  callFocusedWebRuntimeEnvelope,
+  callFocusedWebRuntimeResult,
+  callWebRuntimeEnvelope,
+  callWebRuntimeResultForEnvironment,
+  disconnectWebRuntimeEnvironment,
+  getFocusedWebRuntimeEnvironmentId,
+  getWebRuntimeClient,
+  installWebRuntimeEnvironmentRegistry,
+  listWebRuntimeEnvironments,
+  removeWebRuntimeEnvironment,
+  requireFocusedWebRuntimeEnvironmentOrNull,
+  resolveWebRuntimeEnvironment,
+  setFocusedWebRuntimeEnvironmentId,
+  subscribeWebRuntimeEnvironment
+} from './web-runtime-environment-registry'
+import {
+  invalidateWebRuntimeWorktreeCaches,
+  listAllRuntimeWorktrees as listAllRuntimeWorktreesAcrossEnvironments,
+  listDetectedWorktreesForRepo,
+  resolveRuntimeFilePath as resolveRuntimeFilePathAcrossEnvironments,
+  resolveRuntimeWorktreeByPath as resolveRuntimeWorktreeByPathAcrossEnvironments
+} from './web-runtime-ownership'
 import {
   assertClipboardTextWriteWithinLimitWithYield,
   assertClipboardTextWithinLimitWithYield,
@@ -124,12 +139,13 @@ export const CLIPBOARD_IMAGE_UPLOAD_CHUNK_BASE64_CHARS = 512 * 1024
 export const CLIPBOARD_IMAGE_SINGLE_FRAME_FALLBACK_BASE64_CHARS = 256 * 1024
 const CLIPBOARD_IMAGE_SAVE_TIMEOUT_MS = 30_000
 
-let activeEnvironment: StoredWebRuntimeEnvironment | null = readStoredWebRuntimeEnvironment()
-let activeClient: WebRuntimeClient | null = null
-let activeClientEnvironmentId: string | null = null
-let cachedWorktrees: { loadedAt: number; worktrees: Worktree[] } | null = null
-let cachedDetectedWorktrees: { loadedAt: number; worktrees: Worktree[] } | null = null
-const runtimeCallQueuePool = new RuntimeRpcCallQueuePool()
+async function createQrDataUrl(value: string): Promise<string> {
+  return QRCode.toDataURL(value, {
+    errorCorrectionLevel: 'M',
+    margin: 2,
+    width: 256
+  })
+}
 
 function blobToBase64(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -202,9 +218,8 @@ async function readClipboardImagePngBase64(): Promise<string | null> {
   return null
 }
 
-function invalidateRuntimeWorktreeCaches(): void {
-  cachedWorktrees = null
-  cachedDetectedWorktrees = null
+function invalidateRuntimeWorktreeCaches(environmentId?: string | null): void {
+  invalidateWebRuntimeWorktreeCaches(environmentId)
 }
 
 type WebSettingsApi = NonNullable<PreloadApi['settings']>
@@ -439,7 +454,7 @@ const WEB_KEYBINDING_PLATFORMS: readonly KeybindingPlatform[] = ['darwin', 'linu
 const webKeybindingListeners = new Set<(snapshot: KeybindingFileSnapshot) => void>()
 
 export function installWebPreloadApi(): void {
-  activeEnvironment = readStoredWebRuntimeEnvironment()
+  installWebRuntimeEnvironmentRegistry()
   const webWindow = window as unknown as { __ORCA_WEB_CLIENT__?: boolean }
   webWindow.__ORCA_WEB_CLIENT__ = true
   window.electron = createFallbackProxy(['electron']) as Window['electron']
@@ -499,8 +514,11 @@ function createWebPreloadApi(): Partial<PreloadApi> {
     settings: {
       get: async () => getRuntimeBackedStoredSettings(),
       set: async (updates) => {
-        if (updates.activeRuntimeEnvironmentId === null) {
-          disconnectActiveRuntimeEnvironment()
+        // Why: focus and pairing used to be the same slot, so clearing
+        // activeRuntimeEnvironmentId deleted the stored server. In the multi-server
+        // model it only moves focus — the pairing (and its token) must survive.
+        if ('activeRuntimeEnvironmentId' in updates) {
+          setFocusedWebRuntimeEnvironmentId(updates.activeRuntimeEnvironmentId ?? null)
         }
         const sanitizedUpdates = { ...updates }
         if ('autoRenameBranchFromWorkDefaultedOn' in sanitizedUpdates) {
@@ -672,14 +690,41 @@ function createWebPreloadApi(): Partial<PreloadApi> {
       dropByTabPrefix: () => {}
     },
     mobile: {
-      listNetworkInterfaces: () => Promise.resolve({ interfaces: [] }),
-      getPairingQR: () => Promise.resolve({ available: false }),
+      listNetworkInterfaces: () =>
+        callRuntimeResult<{ interfaces: { name: string; address: string }[] }>(
+          'mobile.pairing.listNetworkInterfaces'
+        ),
+      getPairingQR: async (args) => {
+        const offer = await callRuntimeResult<
+          | { available: false }
+          | {
+              available: true
+              pairingUrl: string
+              endpoint: string
+              deviceId: string
+            }
+        >('mobile.pairing.create', args)
+        if (!offer.available) {
+          return offer
+        }
+        return { ...offer, qrDataUrl: await createQrDataUrl(offer.pairingUrl) }
+      },
       getRuntimePairingUrl: () => Promise.resolve({ available: false }),
-      listDevices: () => Promise.resolve({ devices: [] }),
-      revokeDevice: () => Promise.resolve({ revoked: false }),
+      listDevices: () =>
+        callRuntimeResult<{
+          devices: { deviceId: string; name: string; pairedAt: number; lastSeenAt: number }[]
+        }>('mobile.pairing.listDevices'),
+      revokeDevice: (args) =>
+        callRuntimeResult<{ revoked: boolean }>('mobile.pairing.revokeDevice', args),
       listRuntimeAccessGrants: () => Promise.resolve({ grants: [] }),
       revokeRuntimeAccess: () => Promise.resolve({ revoked: false }),
-      isWebSocketReady: () => Promise.resolve({ ready: Boolean(activeEnvironment), endpoint: null })
+      isWebSocketReady: () => {
+        const environment = requireFocusedWebRuntimeEnvironmentOrNull()
+        return Promise.resolve({
+          ready: environment !== null,
+          endpoint: environment?.endpoints[0]?.endpoint ?? null
+        })
+      }
     },
     telemetryTrack: () => Promise.resolve(),
     telemetrySetOptIn: () => Promise.resolve(),
@@ -1005,16 +1050,16 @@ function createNativeChatApi(): NativeChatApi {
       }),
     subscribe: (args, onAppended) => {
       // No paired runtime yet: nothing to subscribe to, and
-      // requireActiveEnvironment() would throw. Return a no-op teardown so the
+      // requireFocusedWebRuntimeEnvironment() would throw. Return a no-op teardown so the
       // chat view mounts cleanly until a runtime is paired (only the not-paired
       // case is swallowed — real subscribe errors still surface via .catch).
-      const environment = requireActiveEnvironmentOrNull()
+      const environment = requireFocusedWebRuntimeEnvironmentOrNull()
       if (!environment) {
         return () => {}
       }
       let handle: { unsubscribe: () => void } | null = null
       let cancelled = false
-      void getClientForEnvironment(environment)
+      void getWebRuntimeClient(environment)
         .subscribe(
           'nativeChat.subscribe',
           { agent: args.agent, sessionId: args.sessionId, transcriptPath: args.transcriptPath },
@@ -1072,47 +1117,37 @@ function createRuntimeApi(): NonNullable<Partial<PreloadApi>['runtime']> {
   }
 }
 
-function createRuntimeEnvironmentsApi(): NonNullable<Partial<PreloadApi>['runtimeEnvironments']> {
+function createRuntimeEnvironmentsApi(): NonNullable<PreloadApi['runtimeEnvironments']> {
   return {
-    list: async () => {
-      const environment = requireActiveEnvironmentOrNull()
-      return environment ? [redactStoredWebRuntimeEnvironment(environment)] : []
-    },
-    addFromPairingCode: async ({ name, pairingCode }) => {
-      const offer = parseWebPairingInput(pairingCode)
-      if (!offer) {
-        throw new Error('Invalid Orca pairing code.')
+    list: async () => listWebRuntimeEnvironments().map(redactStoredWebRuntimeEnvironment),
+    addFromPairingCode: async ({ name, pairingCode, address }) => {
+      const environment = addWebRuntimeEnvironmentFromPairingCode({ name, pairingCode, address })
+      // Why: the desktop saves a new server without switching focus. The web client
+      // had a single slot, so pairing implied focus; now that several servers can be
+      // saved, a new pairing focuses itself only when nothing else is focused yet.
+      if (!getFocusedWebRuntimeEnvironmentId()) {
+        setFocusedWebRuntimeEnvironmentId(environment.id)
       }
-      closeActiveRuntimeClients()
-      activeEnvironment = createStoredWebRuntimeEnvironment({ name, offer })
-      saveStoredWebRuntimeEnvironment(activeEnvironment)
-      return { environment: redactStoredWebRuntimeEnvironment(activeEnvironment) }
+      return { environment: redactStoredWebRuntimeEnvironment(environment) }
     },
     resolve: async ({ selector }) =>
-      redactStoredWebRuntimeEnvironment(resolveEnvironment(selector)),
+      redactStoredWebRuntimeEnvironment(resolveWebRuntimeEnvironment(selector)),
     remove: async ({ selector }) => {
-      const environment = resolveEnvironment(selector)
-      if (activeEnvironment?.id === environment.id) {
-        disconnectActiveRuntimeEnvironment()
-      }
+      const environment = removeWebRuntimeEnvironment(selector)
+      invalidateWebRuntimeWorktreeCaches(environment.id)
       return { removed: redactStoredWebRuntimeEnvironment(environment) }
     },
     disconnect: async ({ selector }) => {
-      const environment = resolveEnvironment(selector)
-      if (activeEnvironment?.id === environment.id) {
-        disconnectActiveRuntimeEnvironment()
-      }
+      const environment = disconnectWebRuntimeEnvironment(selector)
+      invalidateWebRuntimeWorktreeCaches(environment.id)
       return { disconnected: redactStoredWebRuntimeEnvironment(environment) }
     },
     getStatus: ({ selector, timeoutMs }) =>
       callEnvironmentEnvelope<RuntimeStatus>(selector, 'status.get', undefined, timeoutMs),
     call: ({ selector, method, params, timeoutMs }) =>
       callEnvironmentEnvelope(selector, method, params, timeoutMs),
-    subscribe: async ({ selector, method, params, timeoutMs }, callbacks) => {
-      const environment = resolveEnvironment(selector)
-      const client = getClientForEnvironment(environment)
-      return client.subscribe(method, params, callbacks, { timeoutMs })
-    }
+    subscribe: async ({ selector, method, params, timeoutMs }, callbacks) =>
+      subscribeWebRuntimeEnvironment(selector, method, params, callbacks, { timeoutMs })
   }
 }
 
@@ -1338,14 +1373,14 @@ function createFileApi(): NonNullable<Partial<PreloadApi>['fs']> {
   return {
     readDir: async ({ dirPath }) => {
       const file = await resolveRuntimeFilePath(dirPath)
-      return callRuntimeResult<DirEntry[]>('files.readDir', {
+      return file.call<DirEntry[]>('files.readDir', {
         worktree: toRuntimeWorktreeSelector(file.worktree.id),
         relativePath: file.relativePath
       })
     },
     readFile: async ({ filePath }) => {
       const file = await resolveRuntimeFilePath(filePath)
-      return callRuntimeResult('files.readPreview', {
+      return file.call('files.readPreview', {
         worktree: toRuntimeWorktreeSelector(file.worktree.id),
         relativePath: file.relativePath
       })
@@ -1370,13 +1405,13 @@ function createFileApi(): NonNullable<Partial<PreloadApi>['fs']> {
     },
     listMarkdownDocuments: async ({ rootPath }) => {
       const file = await resolveRuntimeFilePath(rootPath)
-      return callRuntimeResult('files.listMarkdownDocuments', {
+      return file.call('files.listMarkdownDocuments', {
         worktree: toRuntimeWorktreeSelector(file.worktree.id)
       })
     },
     writeFile: async ({ filePath, content }) => {
       const file = await resolveRuntimeFilePath(filePath)
-      await callRuntimeResult('files.write', {
+      await file.call('files.write', {
         worktree: toRuntimeWorktreeSelector(file.worktree.id),
         relativePath: file.relativePath,
         content
@@ -1384,14 +1419,14 @@ function createFileApi(): NonNullable<Partial<PreloadApi>['fs']> {
     },
     createFile: async ({ filePath }) => {
       const file = await resolveRuntimeFilePath(filePath)
-      await callRuntimeResult('files.createFile', {
+      await file.call('files.createFile', {
         worktree: toRuntimeWorktreeSelector(file.worktree.id),
         relativePath: file.relativePath
       })
     },
     createDir: async ({ dirPath }) => {
       const file = await resolveRuntimeFilePath(dirPath)
-      await callRuntimeResult('files.createDir', {
+      await file.call('files.createDir', {
         worktree: toRuntimeWorktreeSelector(file.worktree.id),
         relativePath: file.relativePath
       })
@@ -1399,7 +1434,7 @@ function createFileApi(): NonNullable<Partial<PreloadApi>['fs']> {
     rename: async ({ oldPath, newPath }) => {
       const oldFile = await resolveRuntimeFilePath(oldPath)
       const newFile = await resolveRuntimeFilePath(newPath)
-      await callRuntimeResult('files.rename', {
+      await oldFile.call('files.rename', {
         worktree: toRuntimeWorktreeSelector(oldFile.worktree.id),
         oldRelativePath: oldFile.relativePath,
         newRelativePath: newFile.relativePath
@@ -1408,7 +1443,7 @@ function createFileApi(): NonNullable<Partial<PreloadApi>['fs']> {
     copy: async ({ sourcePath, destinationPath }) => {
       const source = await resolveRuntimeFilePath(sourcePath)
       const destination = await resolveRuntimeFilePath(destinationPath)
-      await callRuntimeResult('files.copy', {
+      await source.call('files.copy', {
         worktree: toRuntimeWorktreeSelector(source.worktree.id),
         sourceRelativePath: source.relativePath,
         destinationRelativePath: destination.relativePath
@@ -1416,7 +1451,7 @@ function createFileApi(): NonNullable<Partial<PreloadApi>['fs']> {
     },
     deletePath: async ({ targetPath, recursive }) => {
       const file = await resolveRuntimeFilePath(targetPath)
-      await callRuntimeResult('files.delete', {
+      await file.call('files.delete', {
         worktree: toRuntimeWorktreeSelector(file.worktree.id),
         relativePath: file.relativePath,
         recursive
@@ -1425,7 +1460,7 @@ function createFileApi(): NonNullable<Partial<PreloadApi>['fs']> {
     authorizeExternalPath: () => Promise.resolve(),
     stat: async ({ filePath }) => {
       const file = await resolveRuntimeFilePath(filePath)
-      return callRuntimeResult('files.stat', {
+      return file.call('files.stat', {
         worktree: toRuntimeWorktreeSelector(file.worktree.id),
         relativePath: file.relativePath
       })
@@ -1433,7 +1468,7 @@ function createFileApi(): NonNullable<Partial<PreloadApi>['fs']> {
     pathExists: async ({ filePath }) => {
       try {
         const file = await resolveRuntimeFilePath(filePath)
-        await callRuntimeResult('files.stat', {
+        await file.call('files.stat', {
           worktree: toRuntimeWorktreeSelector(file.worktree.id),
           relativePath: file.relativePath
         })
@@ -1447,18 +1482,15 @@ function createFileApi(): NonNullable<Partial<PreloadApi>['fs']> {
     },
     listFiles: async ({ rootPath, excludePaths }) => {
       const file = await resolveRuntimeFilePath(rootPath)
-      const result = await callRuntimeResult<{ files: { relativePath: string }[] }>(
-        'files.listAll',
-        {
-          worktree: toRuntimeWorktreeSelector(file.worktree.id),
-          excludePaths
-        }
-      )
+      const result = await file.call<{ files: { relativePath: string }[] }>('files.listAll', {
+        worktree: toRuntimeWorktreeSelector(file.worktree.id),
+        excludePaths
+      })
       return result.files.map((entry) => entry.relativePath)
     },
     search: async (args) => {
       const file = await resolveRuntimeFilePath(args.rootPath)
-      return callRuntimeResult<SearchResult>('files.search', {
+      return file.call<SearchResult>('files.search', {
         worktree: toRuntimeWorktreeSelector(file.worktree.id),
         query: args.query,
         caseSensitive: args.caseSensitive,
@@ -1481,24 +1513,24 @@ function createFileApi(): NonNullable<Partial<PreloadApi>['fs']> {
 function createGitApi(): NonNullable<Partial<PreloadApi>['git']> {
   return {
     status: async ({ worktreePath, includeIgnored }) => {
-      const worktree = await resolveRuntimeWorktreeByPath(worktreePath)
-      return callRuntimeResult('git.status', {
-        worktree: toRuntimeWorktreeSelector(worktree.id),
+      const target = await resolveRuntimeWorktreeOwner(worktreePath)
+      return target.call('git.status', {
+        worktree: toRuntimeWorktreeSelector(target.worktree.id),
         includeIgnored
       })
     },
     submoduleStatus: async ({ worktreePath, submodulePath, area }) => {
-      const worktree = await resolveRuntimeWorktreeByPath(worktreePath)
-      return callRuntimeResult('git.submoduleStatus', {
-        worktree: toRuntimeWorktreeSelector(worktree.id),
+      const target = await resolveRuntimeWorktreeOwner(worktreePath)
+      return target.call('git.submoduleStatus', {
+        worktree: toRuntimeWorktreeSelector(target.worktree.id),
         submodulePath,
         area
       })
     },
     checkIgnored: async ({ worktreePath, paths }) => {
-      const worktree = await resolveRuntimeWorktreeByPath(worktreePath)
-      return callRuntimeResult('git.checkIgnored', {
-        worktree: toRuntimeWorktreeSelector(worktree.id),
+      const target = await resolveRuntimeWorktreeOwner(worktreePath)
+      return target.call('git.checkIgnored', {
+        worktree: toRuntimeWorktreeSelector(target.worktree.id),
         paths
       })
     },
@@ -1507,131 +1539,131 @@ function createGitApi(): NonNullable<Partial<PreloadApi>['git']> {
     findHugeFoldersToIgnore: async () => [],
     appendGitignore: async () => false,
     history: async ({ worktreePath, limit, baseRef }) => {
-      const worktree = await resolveRuntimeWorktreeByPath(worktreePath)
-      return callRuntimeResult('git.history', {
-        worktree: toRuntimeWorktreeSelector(worktree.id),
+      const target = await resolveRuntimeWorktreeOwner(worktreePath)
+      return target.call('git.history', {
+        worktree: toRuntimeWorktreeSelector(target.worktree.id),
         limit,
         baseRef
       })
     },
     conflictOperation: async ({ worktreePath }) => {
-      const worktree = await resolveRuntimeWorktreeByPath(worktreePath)
-      return callRuntimeResult('git.conflictOperation', {
-        worktree: toRuntimeWorktreeSelector(worktree.id)
+      const target = await resolveRuntimeWorktreeOwner(worktreePath)
+      return target.call('git.conflictOperation', {
+        worktree: toRuntimeWorktreeSelector(target.worktree.id)
       })
     },
     abortMerge: async ({ worktreePath }) => {
-      const worktree = await resolveRuntimeWorktreeByPath(worktreePath)
-      await callRuntimeResult('git.abortMerge', {
-        worktree: toRuntimeWorktreeSelector(worktree.id)
+      const target = await resolveRuntimeWorktreeOwner(worktreePath)
+      await target.call('git.abortMerge', {
+        worktree: toRuntimeWorktreeSelector(target.worktree.id)
       })
     },
     abortRebase: async ({ worktreePath }) => {
-      const worktree = await resolveRuntimeWorktreeByPath(worktreePath)
-      await callRuntimeResult('git.abortRebase', {
-        worktree: toRuntimeWorktreeSelector(worktree.id)
+      const target = await resolveRuntimeWorktreeOwner(worktreePath)
+      await target.call('git.abortRebase', {
+        worktree: toRuntimeWorktreeSelector(target.worktree.id)
       })
     },
     diff: async ({ worktreePath, filePath, staged, compareAgainstHead }) => {
-      const file = await resolveRuntimeFilePath(filePath, worktreePath)
-      return callRuntimeResult('git.diff', {
-        worktree: toRuntimeWorktreeSelector(file.worktree.id),
-        filePath: file.relativePath,
+      const target = await resolveRuntimeFilePath(filePath, worktreePath)
+      return target.call('git.diff', {
+        worktree: toRuntimeWorktreeSelector(target.worktree.id),
+        filePath: target.relativePath,
         staged,
         compareAgainstHead
       })
     },
     branchCompare: async ({ worktreePath, baseRef }) => {
-      const worktree = await resolveRuntimeWorktreeByPath(worktreePath)
-      return callRuntimeResult('git.branchCompare', {
-        worktree: toRuntimeWorktreeSelector(worktree.id),
+      const target = await resolveRuntimeWorktreeOwner(worktreePath)
+      return target.call('git.branchCompare', {
+        worktree: toRuntimeWorktreeSelector(target.worktree.id),
         baseRef
       })
     },
     commitCompare: async ({ worktreePath, commitId }) => {
-      const worktree = await resolveRuntimeWorktreeByPath(worktreePath)
-      return callRuntimeResult('git.commitCompare', {
-        worktree: toRuntimeWorktreeSelector(worktree.id),
+      const target = await resolveRuntimeWorktreeOwner(worktreePath)
+      return target.call('git.commitCompare', {
+        worktree: toRuntimeWorktreeSelector(target.worktree.id),
         commitId
       })
     },
     upstreamStatus: async ({ worktreePath, pushTarget }) => {
-      const worktree = await resolveRuntimeWorktreeByPath(worktreePath)
-      return callRuntimeResult('git.upstreamStatus', {
-        worktree: toRuntimeWorktreeSelector(worktree.id),
+      const target = await resolveRuntimeWorktreeOwner(worktreePath)
+      return target.call('git.upstreamStatus', {
+        worktree: toRuntimeWorktreeSelector(target.worktree.id),
         pushTarget
       })
     },
     fetch: async ({ worktreePath, pushTarget }) => {
-      const worktree = await resolveRuntimeWorktreeByPath(worktreePath)
-      await callRuntimeResult('git.fetch', {
-        worktree: toRuntimeWorktreeSelector(worktree.id),
+      const target = await resolveRuntimeWorktreeOwner(worktreePath)
+      await target.call('git.fetch', {
+        worktree: toRuntimeWorktreeSelector(target.worktree.id),
         pushTarget
       })
     },
     syncFork: async ({ worktreePath, expectedUpstream }) => {
-      const worktree = await resolveRuntimeWorktreeByPath(worktreePath)
-      return callRuntimeResult(
+      const target = await resolveRuntimeWorktreeOwner(worktreePath)
+      return target.call(
         'git.forkSync',
         {
-          worktree: toRuntimeWorktreeSelector(worktree.id),
+          worktree: toRuntimeWorktreeSelector(target.worktree.id),
           expectedUpstream
         },
         60_000
       )
     },
     push: async ({ worktreePath, publish, pushTarget }) => {
-      const worktree = await resolveRuntimeWorktreeByPath(worktreePath)
-      await callRuntimeResult('git.push', {
-        worktree: toRuntimeWorktreeSelector(worktree.id),
+      const target = await resolveRuntimeWorktreeOwner(worktreePath)
+      await target.call('git.push', {
+        worktree: toRuntimeWorktreeSelector(target.worktree.id),
         publish,
         pushTarget
       })
     },
     pull: async ({ worktreePath, pushTarget }) => {
-      const worktree = await resolveRuntimeWorktreeByPath(worktreePath)
-      await callRuntimeResult('git.pull', {
-        worktree: toRuntimeWorktreeSelector(worktree.id),
+      const target = await resolveRuntimeWorktreeOwner(worktreePath)
+      await target.call('git.pull', {
+        worktree: toRuntimeWorktreeSelector(target.worktree.id),
         pushTarget
       })
     },
     fastForward: async ({ worktreePath, pushTarget }) => {
-      const worktree = await resolveRuntimeWorktreeByPath(worktreePath)
-      await callRuntimeResult('git.fastForward', {
-        worktree: toRuntimeWorktreeSelector(worktree.id),
+      const target = await resolveRuntimeWorktreeOwner(worktreePath)
+      await target.call('git.fastForward', {
+        worktree: toRuntimeWorktreeSelector(target.worktree.id),
         pushTarget
       })
     },
     rebaseFromBase: async ({ worktreePath, baseRef }) => {
-      const worktree = await resolveRuntimeWorktreeByPath(worktreePath)
-      await callRuntimeResult('git.rebaseFromBase', {
-        worktree: toRuntimeWorktreeSelector(worktree.id),
+      const target = await resolveRuntimeWorktreeOwner(worktreePath)
+      await target.call('git.rebaseFromBase', {
+        worktree: toRuntimeWorktreeSelector(target.worktree.id),
         baseRef
       })
     },
     branchDiff: async ({ worktreePath, filePath, compare, oldPath }) => {
-      const file = await resolveRuntimeFilePath(filePath, worktreePath)
-      return callRuntimeResult('git.branchDiff', {
-        worktree: toRuntimeWorktreeSelector(file.worktree.id),
-        filePath: file.relativePath,
+      const target = await resolveRuntimeFilePath(filePath, worktreePath)
+      return target.call('git.branchDiff', {
+        worktree: toRuntimeWorktreeSelector(target.worktree.id),
+        filePath: target.relativePath,
         compare,
         oldPath
       })
     },
     commitDiff: async ({ worktreePath, filePath, commitOid, parentOid, oldPath }) => {
-      const file = await resolveRuntimeFilePath(filePath, worktreePath)
-      return callRuntimeResult('git.commitDiff', {
-        worktree: toRuntimeWorktreeSelector(file.worktree.id),
-        filePath: file.relativePath,
+      const target = await resolveRuntimeFilePath(filePath, worktreePath)
+      return target.call('git.commitDiff', {
+        worktree: toRuntimeWorktreeSelector(target.worktree.id),
+        filePath: target.relativePath,
         commitOid,
         parentOid,
         oldPath
       })
     },
     commit: async ({ worktreePath, message }) => {
-      const worktree = await resolveRuntimeWorktreeByPath(worktreePath)
-      return callRuntimeResult('git.commit', {
-        worktree: toRuntimeWorktreeSelector(worktree.id),
+      const target = await resolveRuntimeWorktreeOwner(worktreePath)
+      return target.call('git.commit', {
+        worktree: toRuntimeWorktreeSelector(target.worktree.id),
         message
       })
     },
@@ -1673,17 +1705,17 @@ function createGitApi(): NonNullable<Partial<PreloadApi>['git']> {
       }
     },
     remoteFileUrl: async ({ worktreePath, relativePath, line }) => {
-      const worktree = await resolveRuntimeWorktreeByPath(worktreePath)
-      return callRuntimeResult('git.remoteFileUrl', {
-        worktree: toRuntimeWorktreeSelector(worktree.id),
+      const target = await resolveRuntimeWorktreeOwner(worktreePath)
+      return target.call('git.remoteFileUrl', {
+        worktree: toRuntimeWorktreeSelector(target.worktree.id),
         relativePath,
         line
       })
     },
     remoteCommitUrl: async ({ worktreePath, sha }) => {
-      const worktree = await resolveRuntimeWorktreeByPath(worktreePath)
-      return callRuntimeResult('git.remoteCommitUrl', {
-        worktree: toRuntimeWorktreeSelector(worktree.id),
+      const target = await resolveRuntimeWorktreeOwner(worktreePath)
+      return target.call('git.remoteCommitUrl', {
+        worktree: toRuntimeWorktreeSelector(target.worktree.id),
         sha
       })
     }
@@ -2132,7 +2164,7 @@ function createWebUiApi(): NonNullable<Partial<PreloadApi>['ui']> {
       connectionId?: string | null
       runtimeEnvironmentId?: string | null
     }) => {
-      if (!requireActiveEnvironmentOrNull()) {
+      if (!requireFocusedWebRuntimeEnvironmentOrNull()) {
         return null
       }
       const contentBase64 = await readClipboardImagePngBase64()
@@ -2288,29 +2320,29 @@ function createPreflightApi(): NonNullable<Partial<PreloadApi>['preflight']> {
   }
   return {
     check: async (args) => {
-      if (!requireActiveEnvironmentOrNull()) {
+      if (!requireFocusedWebRuntimeEnvironmentOrNull()) {
         return fallbackStatus
       }
       return callRuntimeResult<PreflightStatus>('preflight.check', args)
     },
     detectAgents: async () => {
-      if (!requireActiveEnvironmentOrNull()) {
+      if (!requireFocusedWebRuntimeEnvironmentOrNull()) {
         return []
       }
       return callRuntimeResult<string[]>('preflight.detectAgents').catch(() => [])
     },
     refreshAgents: () =>
-      requireActiveEnvironmentOrNull()
+      requireFocusedWebRuntimeEnvironmentOrNull()
         ? callRuntimeResult('preflight.refreshAgents')
             .then((result) => result as RefreshAgentsResult)
             .catch(() => fallbackRefreshAgents)
         : Promise.resolve(fallbackRefreshAgents),
     detectRemoteAgents: async (args) =>
-      requireActiveEnvironmentOrNull()
+      requireFocusedWebRuntimeEnvironmentOrNull()
         ? callRuntimeResult<string[]>('preflight.detectRemoteAgents', args).catch(() => [])
         : [],
     detectRemoteWindowsTerminalCapabilities: async (args) =>
-      requireActiveEnvironmentOrNull()
+      requireFocusedWebRuntimeEnvironmentOrNull()
         ? callRuntimeResult<WindowsTerminalCapabilityBridgeResult>(
             'preflight.detectRemoteWindowsTerminalCapabilities',
             args
@@ -2647,12 +2679,7 @@ async function callRuntimeEnvelope<TResult = unknown>(
   params?: unknown,
   timeoutMs?: number
 ): Promise<RuntimeRpcResponse<TResult>> {
-  const environment = requireActiveEnvironment()
-  const response = await runtimeCallQueuePool.enqueue(environment.id, method, () =>
-    getClientForEnvironment(environment).call(method, params, { timeoutMs })
-  )
-  updateEnvironmentFromResponse(environment, response)
-  return response as RuntimeRpcResponse<TResult>
+  return callFocusedWebRuntimeEnvelope<TResult>(method, params, timeoutMs)
 }
 
 async function callEnvironmentEnvelope<TResult = unknown>(
@@ -2661,12 +2688,8 @@ async function callEnvironmentEnvelope<TResult = unknown>(
   params?: unknown,
   timeoutMs?: number
 ): Promise<RuntimeRpcResponse<TResult>> {
-  const environment = resolveEnvironment(selector)
-  const response = await runtimeCallQueuePool.enqueue(environment.id, method, () =>
-    getClientForEnvironment(environment).call(method, params, { timeoutMs })
-  )
-  updateEnvironmentFromResponse(environment, response)
-  return response as RuntimeRpcResponse<TResult>
+  const environment = resolveWebRuntimeEnvironment(selector)
+  return callWebRuntimeEnvelope<TResult>(environment, method, params, timeoutMs)
 }
 
 async function callRuntimeResult<TResult>(
@@ -2674,11 +2697,7 @@ async function callRuntimeResult<TResult>(
   params?: unknown,
   timeoutMs?: number
 ): Promise<TResult> {
-  const response = await callRuntimeEnvelope(method, params, timeoutMs)
-  if (!response.ok) {
-    throw new Error(response.error.message)
-  }
-  return response.result as TResult
+  return callFocusedWebRuntimeResult<TResult>(method, params, timeoutMs)
 }
 
 async function saveClipboardImageAsTempFileInRuntime(
@@ -2749,64 +2768,7 @@ async function getRemoteRuntimeStatus(): Promise<RuntimeStatus> {
   return callRuntimeResult<RuntimeStatus>('status.get', undefined, 15_000)
 }
 
-function getClientForEnvironment(environment: StoredWebRuntimeEnvironment): WebRuntimeClient {
-  if (!activeClient || activeClientEnvironmentId !== environment.id) {
-    activeClient?.close()
-    activeClient = new WebRuntimeClient(getPreferredWebPairingOffer(environment))
-    activeClientEnvironmentId = environment.id
-  }
-  return activeClient
-}
-
-function closeActiveRuntimeClients(): void {
-  activeClient?.close()
-  activeClient = null
-  activeClientEnvironmentId = null
-  invalidateRuntimeWorktreeCaches()
-}
-
-function disconnectActiveRuntimeEnvironment(): void {
-  closeActiveRuntimeClients()
-  clearStoredWebRuntimeEnvironment()
-  activeEnvironment = null
-}
-
-function resolveEnvironment(selector: string): StoredWebRuntimeEnvironment {
-  const environment = requireActiveEnvironment()
-  if (selector === environment.id || selector === environment.name || selector === 'active') {
-    return environment
-  }
-  if (selector.startsWith('web-') && environment.id.startsWith('web-')) {
-    // Why: persisted terminal ids can outlive a web-client re-pair, which creates
-    // a fresh web-* environment id even when it points at the same active server.
-    return environment
-  }
-  throw new Error(`Unknown Orca runtime environment: ${selector}`)
-}
-
-function requireActiveEnvironment(): StoredWebRuntimeEnvironment {
-  activeEnvironment = activeEnvironment ?? readStoredWebRuntimeEnvironment()
-  if (!activeEnvironment) {
-    throw new Error('Pair this web client with an Orca server first.')
-  }
-  return activeEnvironment
-}
-
-function requireActiveEnvironmentOrNull(): StoredWebRuntimeEnvironment | null {
-  activeEnvironment = activeEnvironment ?? readStoredWebRuntimeEnvironment()
-  return activeEnvironment
-}
-
-function updateEnvironmentFromResponse(
-  environment: StoredWebRuntimeEnvironment,
-  response: RuntimeRpcResponse<unknown>
-): void {
-  const runtimeId = response.ok ? response._meta.runtimeId : (response._meta?.runtimeId ?? null)
-  activeEnvironment = updateStoredEnvironmentRuntimeId(environment, runtimeId)
-}
-
 function getStoredSettings(): GlobalSettings {
-  const environment = (activeEnvironment = activeEnvironment ?? readStoredWebRuntimeEnvironment())
   const defaults = getDefaultSettings('~')
   const rawStoredSettings = window.localStorage.getItem(SETTINGS_STORAGE_KEY)
   const stored = readJson<Partial<GlobalSettings>>(SETTINGS_STORAGE_KEY, {})
@@ -2842,7 +2804,7 @@ function getStoredSettings(): GlobalSettings {
       ...defaults,
       floatingTerminalEnabled: false,
       rightSidebarOpenByDefault: false,
-      activeRuntimeEnvironmentId: environment?.id ?? null
+      activeRuntimeEnvironmentId: getFocusedWebRuntimeEnvironmentId()
     },
     migratedStored
   )
@@ -2850,7 +2812,7 @@ function getStoredSettings(): GlobalSettings {
 
 async function getRuntimeBackedStoredSettings(): Promise<GlobalSettings> {
   const local = getStoredSettings()
-  if (!requireActiveEnvironmentOrNull()) {
+  if (!requireFocusedWebRuntimeEnvironmentOrNull()) {
     return local
   }
   try {
@@ -2886,7 +2848,7 @@ async function syncRuntimeBackedSettings(
   updates: Partial<GlobalSettings>,
   localNext: GlobalSettings
 ): Promise<GlobalSettings> {
-  if (!requireActiveEnvironmentOrNull()) {
+  if (!requireFocusedWebRuntimeEnvironmentOrNull()) {
     return localNext
   }
   const runtimeUpdates: Partial<GlobalSettings> = {}
@@ -2957,7 +2919,7 @@ function getStoredWorkspaceSession(hostId?: string | null): WorkspaceSessionStat
   const localSession = sanitizeWebRuntimeWorkspaceSession(
     readJson(SESSION_STORAGE_KEY, getDefaultWorkspaceSession())
   )
-  if (!requireActiveEnvironmentOrNull()) {
+  if (!requireFocusedWebRuntimeEnvironmentOrNull()) {
     return localSession
   }
   const ui = readLocalWebUIState()
@@ -3095,7 +3057,8 @@ function mergeSettings(
       ...(base.voice ?? defaults.voice),
       ...updates.voice
     } as NonNullable<GlobalSettings['voice']>,
-    activeRuntimeEnvironmentId: activeEnvironment?.id ?? updates.activeRuntimeEnvironmentId ?? null,
+    activeRuntimeEnvironmentId:
+      getFocusedWebRuntimeEnvironmentId() ?? updates.activeRuntimeEnvironmentId ?? null,
     terminalCustomThemes: normalizeTerminalCustomThemes(
       updates.terminalCustomThemes ?? base.terminalCustomThemes
     ),
@@ -3110,66 +3073,11 @@ function mergeSettings(
 }
 
 async function listAllRuntimeWorktrees(): Promise<Worktree[]> {
-  if (cachedWorktrees && Date.now() - cachedWorktrees.loadedAt < 5_000) {
-    return cachedWorktrees.worktrees
-  }
-  const result = await callRuntimeResult<{ worktrees: Worktree[] }>('worktree.list', {
-    limit: WEB_RUNTIME_WORKTREE_LIST_LIMIT
-  })
-  cachedWorktrees = { loadedAt: Date.now(), worktrees: result.worktrees }
-  return result.worktrees
-}
-
-async function listAllRuntimeDetectedWorktrees(): Promise<Worktree[]> {
-  if (cachedDetectedWorktrees && Date.now() - cachedDetectedWorktrees.loadedAt < 5_000) {
-    return cachedDetectedWorktrees.worktrees
-  }
-
-  const repos = (await callRuntimeResult<{ repos: Repo[] }>('repo.list')).repos
-  const detectedLists = await Promise.all(
-    repos.map((repo) => callRuntimeDetectedWorktrees(repo.id))
-  )
-  const worktrees = detectedLists.flatMap((result) => result.worktrees)
-  cachedDetectedWorktrees = { loadedAt: Date.now(), worktrees }
-  return worktrees
+  return listAllRuntimeWorktreesAcrossEnvironments()
 }
 
 async function callRuntimeDetectedWorktrees(repoId: string): Promise<DetectedWorktreeListResult> {
-  const response = await callRuntimeEnvelope<DetectedWorktreeListResult>(
-    'worktree.detectedList',
-    { repo: repoId },
-    15_000
-  )
-  if (response.ok) {
-    return response.result
-  }
-  if (response.error.code !== 'method_not_found') {
-    throw new Error(response.error.message)
-  }
-
-  const legacy = await callRuntimeResult<{ worktrees: Worktree[] }>(
-    'worktree.list',
-    { repo: repoId, limit: WEB_RUNTIME_WORKTREE_LIST_LIMIT },
-    15_000
-  )
-  return toLegacyDetectedWorktreeResult(repoId, legacy.worktrees)
-}
-
-function toLegacyDetectedWorktreeResult(
-  repoId: string,
-  worktrees: Worktree[]
-): DetectedWorktreeListResult {
-  return {
-    repoId,
-    authoritative: true,
-    source: 'session-fallback',
-    worktrees: worktrees.map((worktree) => ({
-      ...worktree,
-      ownership: 'orca-managed',
-      selectedCheckout: false,
-      visible: true
-    }))
-  }
+  return listDetectedWorktreesForRepo(repoId)
 }
 
 function isMissingPathError(error: unknown): boolean {
@@ -3179,35 +3087,40 @@ function isMissingPathError(error: unknown): boolean {
   return /\bENOENT\b|not found|no such file/i.test(error.message)
 }
 
-async function resolveRuntimeWorktreeByPath(worktreePath: string): Promise<Worktree> {
-  // Why: hidden-but-open worktrees must still resolve for git/file operations.
-  // `worktree.list` is sidebar-visible only, so path resolution uses detected rows.
-  const worktrees = await listAllRuntimeDetectedWorktrees()
-  const match = worktrees
-    .map((worktree) => ({
-      worktree,
-      relativePath: relativePathInsideRoot(worktree.path, worktreePath)
-    }))
-    .filter((entry) => entry.relativePath !== null)
-    .sort((a, b) => b.worktree.path.length - a.worktree.path.length)[0]
-  if (!match) {
-    throw new Error(`No runtime worktree owns ${worktreePath}`)
-  }
-  return match.worktree
+async function resolveRuntimeWorktreeOwner(worktreePath: string): Promise<{
+  environment: StoredWebRuntimeEnvironment
+  worktree: Worktree
+  call: <TResult>(method: string, params?: unknown, timeoutMs?: number) => Promise<TResult>
+}> {
+  const target = await resolveRuntimeWorktreeByPathAcrossEnvironments(worktreePath)
+  return bindRuntimeEnvironmentTarget(target)
 }
 
 async function resolveRuntimeFilePath(
   filePath: string,
   preferredWorktreePath?: string
-): Promise<{ worktree: Worktree; relativePath: string }> {
-  const worktree = preferredWorktreePath
-    ? await resolveRuntimeWorktreeByPath(preferredWorktreePath)
-    : await resolveRuntimeWorktreeByPath(filePath)
-  const relativePath = relativePathInsideRoot(worktree.path, filePath)
-  if (relativePath === null) {
-    throw new Error(`File is outside runtime worktree: ${filePath}`)
+): Promise<{
+  environment: StoredWebRuntimeEnvironment
+  worktree: Worktree
+  relativePath: string
+  call: <TResult>(method: string, params?: unknown, timeoutMs?: number) => Promise<TResult>
+}> {
+  const target = await resolveRuntimeFilePathAcrossEnvironments(filePath, preferredWorktreePath)
+  return bindRuntimeEnvironmentTarget(target)
+}
+
+// Why: fs/git preload signatures carry only a path, so each resolved path pins the
+// paired server that owns it and every follow-up RPC must go back to that same one.
+function bindRuntimeEnvironmentTarget<TTarget extends { environment: StoredWebRuntimeEnvironment }>(
+  target: TTarget
+): TTarget & {
+  call: <TResult>(method: string, params?: unknown, timeoutMs?: number) => Promise<TResult>
+} {
+  return {
+    ...target,
+    call: <TResult>(method: string, params?: unknown, timeoutMs?: number) =>
+      callWebRuntimeResultForEnvironment<TResult>(target.environment, method, params, timeoutMs)
   }
-  return { worktree, relativePath }
 }
 
 async function mutateGitPath(
@@ -3216,7 +3129,7 @@ async function mutateGitPath(
   filePath: string
 ): Promise<void> {
   const file = await resolveRuntimeFilePath(filePath, worktreePath)
-  await callRuntimeResult(method, {
+  await callWebRuntimeResultForEnvironment(file.environment, method, {
     worktree: toRuntimeWorktreeSelector(file.worktree.id),
     filePath: file.relativePath
   })
@@ -3227,8 +3140,11 @@ async function mutateGitPaths(
   worktreePath: string,
   filePaths: string[]
 ): Promise<void> {
-  const worktree = await resolveRuntimeWorktreeByPath(worktreePath)
-  await callRuntimeResult(method, { worktree: toRuntimeWorktreeSelector(worktree.id), filePaths })
+  const target = await resolveRuntimeWorktreeOwner(worktreePath)
+  await callWebRuntimeResultForEnvironment(target.environment, method, {
+    worktree: toRuntimeWorktreeSelector(target.worktree.id),
+    filePaths
+  })
 }
 
 function mapRepoPathArg(args: unknown): unknown {

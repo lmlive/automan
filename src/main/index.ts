@@ -1415,6 +1415,7 @@ async function printServeReady(options: ServeOptions): Promise<void> {
         pairing: pairing.available
           ? {
               url: pairing.pairingUrl,
+              token: pairing.pairingToken,
               endpoint: pairing.endpoint,
               deviceId: pairing.deviceId,
               webClientUrl: pairing.webClientUrl,
@@ -1434,7 +1435,9 @@ async function printServeReady(options: ServeOptions): Promise<void> {
     if (options.mobilePairing && pairingQr) {
       console.log(`Mobile pairing QR:\n${pairingQr}`)
     }
-    console.log(`Pairing URL: ${pairing.pairingUrl}`)
+    console.log(`Server address: ${pairing.endpoint}`)
+    console.log(`Access token: ${pairing.pairingToken}`)
+    console.log(`Pairing URL (legacy): ${pairing.pairingUrl}`)
   }
 }
 

@@ -81,7 +81,7 @@ export function registerRuntimeEnvironmentHandlers(store: Store): void {
     'runtimeEnvironments:addFromPairingCode',
     (
       _event,
-      args: { name: string; pairingCode: string }
+      args: { name: string; pairingCode: string; address?: string }
     ): { environment: PublicKnownRuntimeEnvironment } => ({
       environment: redactRuntimeEnvironment(addEnvironmentFromPairingCode(getUserDataPath(), args))
     })

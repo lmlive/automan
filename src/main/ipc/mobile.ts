@@ -123,6 +123,7 @@ export function registerMobileHandlers(rpcServer: OrcaRuntimeRpcServer): void {
       return {
         available: true as const,
         pairingUrl: offer.pairingUrl,
+        pairingToken: offer.pairingToken,
         webClientUrl: offer.webClientUrl,
         endpoint: offer.endpoint,
         deviceId: offer.deviceId

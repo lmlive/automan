@@ -14,8 +14,9 @@ import {
 import {
   createStoredWebRuntimeEnvironment,
   readStoredWebRuntimeEnvironment,
-  saveStoredWebRuntimeEnvironment
+  upsertStoredWebRuntimeEnvironment
 } from './web-runtime-environment'
+import { setFocusedWebRuntimeEnvironmentId } from './web-runtime-environment-registry'
 import { installWebPreloadApi } from './web-preload-api'
 import { I18nProvider } from '../i18n/I18nProvider'
 import { translate } from '../i18n/i18n'
@@ -41,9 +42,12 @@ function WebRoot(): React.JSX.Element {
   }, [initialPairingInput])
   const [hasEnvironment, setHasEnvironment] = useState(() => {
     if (startupDecision.kind === 'auto-save-runtime-offer') {
-      saveStoredWebRuntimeEnvironment(
-        createStoredWebRuntimeEnvironment({ name: 'Orca Server', offer: startupDecision.offer })
-      )
+      const environment = createStoredWebRuntimeEnvironment({
+        name: 'Orca Server',
+        offer: startupDecision.offer
+      })
+      upsertStoredWebRuntimeEnvironment(environment)
+      setFocusedWebRuntimeEnvironmentId(environment.id)
       return true
     }
     return startupDecision.kind === 'use-stored-environment'

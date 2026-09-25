@@ -6,7 +6,7 @@ export function canSelectAddRepoHost(host: Pick<SidebarHostOption, 'health' | 'k
 
 export function canConnectAddRepoHost(host: Pick<SidebarHostOption, 'health' | 'kind'>): boolean {
   return (
-    host.kind === 'ssh' &&
+    (host.kind === 'ssh' || host.kind === 'runtime') &&
     (host.health === 'disconnected' || host.health === 'error' || host.health === 'connecting')
   )
 }

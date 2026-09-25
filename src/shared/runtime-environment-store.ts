@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { parsePairingCode, type PairingOffer } from './pairing'
+import {
+  createPairingOfferFromAddressAndToken,
+  parsePairingCode,
+  type PairingOffer
+} from './pairing'
 import { hardenExistingSecureFile, writeSecureJsonFile } from './secure-file'
 import {
   createEnvironmentFromPairingOffer,
@@ -37,13 +41,23 @@ export function listEnvironments(userDataPath: string): KnownRuntimeEnvironment[
 
 export function addEnvironmentFromPairingCode(
   userDataPath: string,
-  args: { name: string; pairingCode: string; now?: number; source?: RuntimeEnvironmentSource }
+  args: {
+    name: string
+    pairingCode: string
+    address?: string
+    now?: number
+    source?: RuntimeEnvironmentSource
+  }
 ): KnownRuntimeEnvironment {
-  const offer = parsePairingCode(args.pairingCode)
+  const offer = args.address
+    ? createPairingOfferFromAddressAndToken(args.address, args.pairingCode)
+    : parsePairingCode(args.pairingCode)
   if (!offer) {
     throw new RuntimeEnvironmentStoreError(
       'invalid_argument',
-      'Invalid pairing code. Expected an orca://pair?... URL or bare pairing payload.'
+      args.address
+        ? 'Invalid server address or token.'
+        : 'Invalid pairing code. Expected an orca://pair?... URL or bare pairing payload.'
     )
   }
   const store = readEnvironmentStore(userDataPath)

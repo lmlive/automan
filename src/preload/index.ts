@@ -3760,6 +3760,7 @@ const api = {
     addFromPairingCode: (args: {
       name: string
       pairingCode: string
+      address?: string
     }): Promise<{ environment: PublicKnownRuntimeEnvironment }> =>
       ipcRenderer.invoke('runtimeEnvironments:addFromPairingCode', args),
     resolve: (args: { selector: string }): Promise<PublicKnownRuntimeEnvironment> =>
@@ -4040,6 +4041,7 @@ const api = {
       | {
           available: true
           pairingUrl: string
+          pairingToken: string
           webClientUrl: string | null
           endpoint: string
           deviceId: string

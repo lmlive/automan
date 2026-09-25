@@ -133,7 +133,20 @@ export function useAddRepoHostSelection({
     async (hostId: ExecutionHostId): Promise<void> => {
       const host = selectableHostOptions.find((candidate) => candidate.id === hostId)
       const parsed = parseExecutionHostId(hostId)
-      if (!host || parsed?.kind !== 'ssh') {
+      if (!host || !parsed) {
+        return
+      }
+      if (parsed.kind === 'runtime') {
+        const switched = await switchRuntimeEnvironment(parsed.environmentId)
+        if (!switched) {
+          return
+        }
+        setSelectedAddProjectHostId(hostId)
+        setStep('add')
+        setHostSelectorOpen(false)
+        return
+      }
+      if (parsed.kind !== 'ssh') {
         return
       }
 

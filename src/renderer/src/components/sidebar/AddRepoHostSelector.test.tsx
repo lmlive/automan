@@ -94,6 +94,43 @@ describe('AddRepoHostSelector', () => {
     expect(html).not.toContain('opacity-55')
   })
 
+  it('shows disconnected runtime hosts with a connect action in Add Project', () => {
+    const html = renderToStaticMarkup(
+      <AddRepoHostSelector
+        hosts={[
+          {
+            id: 'local',
+            label: 'Local Mac',
+            detail: 'This computer',
+            kind: 'local',
+            health: 'local',
+            presence: 'local'
+          },
+          {
+            id: 'runtime:env-1',
+            label: 'ModelScope',
+            detail: 'Orca server',
+            kind: 'runtime',
+            health: 'disconnected',
+            presence: 'project'
+          }
+        ]}
+        selectedHostId="local"
+        open
+        onOpenChange={vi.fn()}
+        onSelectHost={vi.fn()}
+        onConnectHost={vi.fn()}
+      />
+    )
+
+    expect(html).toContain('ModelScope')
+    expect(html).toContain('Disconnected')
+    expect(html).toContain('Connect')
+    expect(html).toContain('aria-disabled="true"')
+    expect(html).not.toContain('cursor-not-allowed')
+    expect(html).not.toContain('opacity-55')
+  })
+
   it('shows exact update guidance for incompatible runtime hosts', () => {
     const html = renderToStaticMarkup(
       <AddRepoHostSelector

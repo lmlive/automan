@@ -6,6 +6,7 @@
 // live in `rpc/unix-socket-transport.ts` and `rpc/ws-transport.ts`.
 import { randomBytes } from 'node:crypto'
 import { readdirSync, rmSync } from 'node:fs'
+import { networkInterfaces } from 'node:os'
 import { join } from 'node:path'
 import type { RuntimeMetadata, RuntimeTransportMetadata } from '../../shared/runtime-bootstrap'
 import type { OrcaRuntimeService } from './orca-runtime'
@@ -25,13 +26,34 @@ import {
   type E2EEIssuedSessionToken
 } from './rpc/e2ee-channel'
 import { isSessionTokenShaped, signSessionToken, verifySessionToken } from '../auth/jwt'
-import { encodePairingOffer, PAIRING_OFFER_VERSION } from '../../shared/pairing'
+import { encodePairingOffer, encodePairingToken, PAIRING_OFFER_VERSION } from '../../shared/pairing'
+import { isTailnetIPv4Address } from '../../shared/tailnet-address'
 import {
   decodeTerminalStreamFrame,
   type TerminalStreamFrame
 } from '../../shared/terminal-stream-protocol'
 
 const DEFAULT_WS_PORT = 6768
+
+type PairingNetworkInterface = { name: string; address: string }
+
+function getNetworkInterfaces(): PairingNetworkInterface[] {
+  const result: PairingNetworkInterface[] = []
+  for (const [name, addresses] of Object.entries(networkInterfaces())) {
+    for (const address of addresses ?? []) {
+      if (address.family === 'IPv4' && !address.internal) {
+        result.push({ name, address: address.address })
+      }
+    }
+  }
+  return result.sort(
+    (a, b) => Number(isTailnetIPv4Address(b.address)) - Number(isTailnetIPv4Address(a.address))
+  )
+}
+
+function getDefaultPairingAddress(): string | null {
+  return getNetworkInterfaces()[0]?.address ?? null
+}
 
 type OrcaRuntimeRpcServerOptions = {
   runtime: OrcaRuntimeService
@@ -532,6 +554,49 @@ export class OrcaRuntimeRpcServer {
     return true
   }
 
+  // Why: server-side pairing management must be reachable from a remotely
+  // rendered web client, while the generated mobile token remains scope-limited.
+  private mobilePairingApi(): {
+    listNetworkInterfaces: () => { interfaces: { name: string; address: string }[] }
+    create: (args?: {
+      address?: string
+      rotate?: boolean
+    }) => ReturnType<OrcaRuntimeRpcServer['createPairingOffer']>
+    listDevices: () => {
+      devices: {
+        deviceId: string
+        name: string
+        pairedAt: number
+        lastSeenAt: number
+      }[]
+    }
+    revokeDevice: (deviceId: string) => { revoked: boolean }
+  } {
+    return {
+      listNetworkInterfaces: () => ({ interfaces: getNetworkInterfaces() }),
+      create: (args) =>
+        this.createPairingOffer({
+          address: args?.address ?? getDefaultPairingAddress(),
+          rotate: args?.rotate,
+          name: `Mobile ${new Date().toLocaleDateString()}`,
+          scope: 'mobile'
+        }),
+      listDevices: () => ({
+        devices:
+          this.deviceRegistry
+            ?.listDevices()
+            .filter((device) => device.scope === 'mobile' && device.lastSeenAt > 0)
+            .map((device) => ({
+              deviceId: device.deviceId,
+              name: device.name,
+              pairedAt: device.pairedAt,
+              lastSeenAt: device.lastSeenAt
+            })) ?? []
+      }),
+      revokeDevice: (deviceId) => ({ revoked: this.revokeMobileDevice(deviceId) })
+    }
+  }
+
   getWebSocketEndpoint(): string | null {
     const ws = this.transports.find((t) => t.kind === 'websocket')
     return ws?.endpoint ?? null
@@ -547,6 +612,7 @@ export class OrcaRuntimeRpcServer {
     | {
         available: true
         pairingUrl: string
+        pairingToken: string
         endpoint: string
         deviceId: string
         webClientUrl: string | null
@@ -563,16 +629,18 @@ export class OrcaRuntimeRpcServer {
     const device = args.rotate
       ? this.deviceRegistry.rotatePendingDevice(deviceName, scope)
       : this.deviceRegistry.getOrCreatePendingDevice(deviceName, scope)
-    const pairingUrl = encodePairingOffer({
+    const pairingOffer = {
       v: PAIRING_OFFER_VERSION,
       endpoint,
       deviceToken: device.token,
       publicKeyB64,
       scope
-    })
+    } as const
+    const pairingUrl = encodePairingOffer(pairingOffer)
     return {
       available: true,
       pairingUrl,
+      pairingToken: encodePairingToken(pairingOffer),
       endpoint,
       deviceId: device.deviceId,
       webClientUrl:
@@ -1018,6 +1086,9 @@ export class OrcaRuntimeRpcServer {
       )
       return
     }
+    if (device.scope === 'runtime' && (await this.dispatchMobilePairingRequest(request, reply))) {
+      return
+    }
 
     // Why: associate the deviceToken with this WebSocket so ws.on('close')
     // can notify the runtime which mobile client disconnected.
@@ -1070,6 +1141,48 @@ export class OrcaRuntimeRpcServer {
         this.activeLongPolls = Math.max(0, this.activeLongPolls - 1)
       }
     }
+  }
+
+  // Why: mobile pairing administration belongs to the server, not the runtime
+  // service method table. Handle these authenticated runtime-scope requests at
+  // the WebSocket security boundary that owns pairing credentials and sockets.
+  private async dispatchMobilePairingRequest(
+    request: RpcRequest,
+    reply: (response: string) => void
+  ): Promise<boolean> {
+    const api = this.mobilePairingApi()
+    let result: unknown
+    switch (request.method) {
+      case 'mobile.pairing.listNetworkInterfaces':
+        result = api.listNetworkInterfaces()
+        break
+      case 'mobile.pairing.create':
+        result = api.create(request.params as { address?: string; rotate?: boolean } | undefined)
+        break
+      case 'mobile.pairing.listDevices':
+        result = api.listDevices()
+        break
+      case 'mobile.pairing.revokeDevice': {
+        const deviceId = (request.params as { deviceId?: unknown } | undefined)?.deviceId
+        if (typeof deviceId !== 'string' || deviceId.length === 0) {
+          reply(JSON.stringify(this.buildError(request.id, 'bad_request', 'Missing device id')))
+          return true
+        }
+        result = api.revokeDevice(deviceId)
+        break
+      }
+      default:
+        return false
+    }
+    reply(
+      JSON.stringify({
+        id: request.id,
+        ok: true,
+        result,
+        _meta: { runtimeId: this.runtime.getRuntimeId() }
+      })
+    )
+    return true
   }
 
   private buildError(id: string, code: string, message: string): RpcResponse {

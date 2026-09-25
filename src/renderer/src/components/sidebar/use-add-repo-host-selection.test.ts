@@ -214,6 +214,24 @@ describe('useAddRepoHostSelection', () => {
     expect(setStep).toHaveBeenCalledWith('add')
   })
 
+  it('connects and selects a disconnected runtime host from Add Project', async () => {
+    mocks.stateValues = ['local', true]
+    mocks.hostOptions[2] = {
+      ...mocks.hostOptions[2],
+      health: 'disconnected'
+    }
+    const setStep = vi.fn()
+    const { useAddRepoHostSelection } = await import('./use-add-repo-host-selection')
+
+    const result = useAddRepoHostSelection({ isOpen: true, setStep })
+    await result.handleConnectAddProjectHost('runtime:env-1')
+
+    expect(mocks.storeState.switchRuntimeEnvironment).toHaveBeenCalledWith('env-1')
+    expect(mocks.stateSetters[0]).toHaveBeenCalledWith('runtime:env-1')
+    expect(mocks.stateSetters[1]).toHaveBeenCalledWith(false)
+    expect(setStep).toHaveBeenCalledWith('add')
+  })
+
   it('defaults to an available runtime host in the web client', async () => {
     mocks.stateValues = ['local', false]
     ;(window as unknown as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__ = true

@@ -2761,6 +2761,7 @@ export type PreloadApi = {
     addFromPairingCode: (args: {
       name: string
       pairingCode: string
+      address?: string
     }) => Promise<{ environment: PublicKnownRuntimeEnvironment }>
     resolve: (args: { selector: string }) => Promise<PublicKnownRuntimeEnvironment>
     remove: (args: { selector: string }) => Promise<{ removed: PublicKnownRuntimeEnvironment }>
@@ -2939,6 +2940,7 @@ export type PreloadApi = {
       | {
           available: true
           pairingUrl: string
+          pairingToken: string
           webClientUrl: string | null
           endpoint: string
           deviceId: string

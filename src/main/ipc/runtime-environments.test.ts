@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { encodePairingOffer } from '../../shared/pairing'
+import { encodePairingOffer, encodePairingToken } from '../../shared/pairing'
 import { REMOTE_RUNTIME_SHARED_CONTROL_CAPABILITY } from '../../shared/protocol-version'
 import * as environmentStore from '../../shared/runtime-environment-store'
 
@@ -62,12 +62,20 @@ vi.mock('./runtime-environment-request-connections', () => ({
 import { registerRuntimeEnvironmentHandlers } from './runtime-environments'
 
 function pairingCode(endpoint = 'ws://127.0.0.1:6768'): string {
-  return encodePairingOffer({
-    v: 2,
+  return encodePairingOffer(pairingOffer(endpoint))
+}
+
+function pairingToken(): string {
+  return encodePairingToken(pairingOffer('ws://127.0.0.1:6768'))
+}
+
+function pairingOffer(endpoint: string) {
+  return {
+    v: 2 as const,
     endpoint,
     deviceToken: 'device-token',
     publicKeyB64: Buffer.from(new Uint8Array(32).fill(1)).toString('base64')
-  })
+  }
 }
 
 function handler<TArgs, TResult>(
@@ -149,6 +157,25 @@ describe('registerRuntimeEnvironmentHandlers', () => {
       'runtimeEnvironments:unsubscribe'
     ])
     expect(removeAllListenersMock).toHaveBeenCalledWith('runtimeEnvironments:subscriptionBinary')
+  })
+
+  it('stores an environment from server address and access token', async () => {
+    registerRuntimeEnvironmentHandlers(store as never)
+
+    const add = handler<
+      { name: string; pairingCode: string; address?: string },
+      { environment: { id: string; name: string } }
+    >('runtimeEnvironments:addFromPairingCode')
+    const added = await add(null, {
+      name: 'token-host',
+      address: '192.168.1.25',
+      pairingCode: pairingToken()
+    })
+
+    expect(added.environment.name).toBe('token-host')
+    expect(
+      environmentStore.resolveEnvironmentPairingOffer(userDataPath, added.environment.id)
+    ).toEqual(pairingOffer('ws://192.168.1.25:6768'))
   })
 
   it('stores, resolves, lists, and removes environments under Electron userData', async () => {

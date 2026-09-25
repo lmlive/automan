@@ -267,6 +267,7 @@ export function RuntimeEnvironmentsPane({
   const [switchError, setSwitchError] = useState<string | null>(null)
   const [removeError, setRemoveError] = useState<string | null>(null)
   const [name, setName] = useState('')
+  const [serverAddress, setServerAddress] = useState('')
   const [pairingCode, setPairingCode] = useState('')
   const mountedRef = useMountedRef()
   const activeValue =
@@ -384,17 +385,19 @@ export function RuntimeEnvironmentsPane({
     }
     setAddServerFormOpen(false)
     setName('')
+    setServerAddress('')
     setPairingCode('')
   }
 
   const addEnvironment = async (): Promise<void> => {
     const trimmedName = name.trim()
+    const trimmedAddress = serverAddress.trim()
     const trimmedPairingCode = pairingCode.trim()
-    if (!trimmedName || !trimmedPairingCode) {
+    if (!trimmedName || !trimmedAddress || !trimmedPairingCode) {
       toast.error(
         translate(
           'auto.components.settings.RuntimeEnvironmentsPane.0c55a47480',
-          'Name and pairing code are required.'
+          'Name, server address, and token are required.'
         )
       )
       return
@@ -414,22 +417,20 @@ export function RuntimeEnvironmentsPane({
     }
     setIsSaving(true)
     try {
-      if (!allowLocalRuntime && settings.activeRuntimeEnvironmentId) {
-        const disconnected = await switchRuntimeEnvironment(null)
-        if (!disconnected) {
-          return
-        }
-      }
       const result = await window.api.runtimeEnvironments.addFromPairingCode({
         name: trimmedName,
+        address: trimmedAddress,
         pairingCode: trimmedPairingCode
       })
       if (mountedRef.current) {
         setName('')
+        setServerAddress('')
         setPairingCode('')
       }
       await loadEnvironments()
       if (!allowLocalRuntime) {
+        // Why: adding a server only adds it; the previously paired servers keep
+        // their storage and live clients. Focus follows the newly added one.
         const switched = await switchRuntimeEnvironment(result.environment.id)
         if (!switched) {
           await window.api.runtimeEnvironments.remove({ selector: result.environment.id })
@@ -494,19 +495,6 @@ export function RuntimeEnvironmentsPane({
             )
           }
           return false
-        }
-        if (!allowLocalRuntime) {
-          await loadEnvironments()
-          if (mountedRef.current) {
-            toast.success(
-              translate(
-                'auto.components.settings.RuntimeEnvironmentsPane.b5b5114cb0',
-                'Removed {{value0}}.',
-                { value0: environment.name }
-              )
-            )
-          }
-          return true
         }
       }
       await window.api.runtimeEnvironments.remove({ selector: environment.id })
@@ -774,7 +762,7 @@ export function RuntimeEnvironmentsPane({
               void addEnvironment()
             }}
           >
-            <div className="grid gap-3 sm:grid-cols-[minmax(0,180px)_minmax(0,1fr)]">
+            <div className="grid gap-3 sm:grid-cols-3">
               <div className="space-y-1">
                 <Label htmlFor="runtime-server-name">
                   {translate(
@@ -795,10 +783,29 @@ export function RuntimeEnvironmentsPane({
                 />
               </div>
               <div className="space-y-1">
+                <Label htmlFor="runtime-server-address">
+                  {translate(
+                    'auto.components.settings.RuntimeEnvironmentsPane.serverAddress',
+                    'Server IP or address'
+                  )}
+                </Label>
+                <Input
+                  id="runtime-server-address"
+                  value={serverAddress}
+                  onChange={(event) => setServerAddress(event.target.value)}
+                  placeholder={translate(
+                    'auto.components.settings.RuntimeEnvironmentsPane.addressPlaceholder',
+                    '192.168.1.10'
+                  )}
+                  className="h-8 min-w-0 font-mono text-xs"
+                  spellCheck={false}
+                />
+              </div>
+              <div className="space-y-1">
                 <Label htmlFor="runtime-server-pairing-code">
                   {translate(
                     'auto.components.settings.RuntimeEnvironmentsPane.9bc9b83474',
-                    'Pairing code'
+                    'Access token'
                   )}
                 </Label>
                 <Input
@@ -808,21 +815,15 @@ export function RuntimeEnvironmentsPane({
                   onChange={(event) => setPairingCode(event.target.value)}
                   placeholder={translate(
                     'auto.components.settings.RuntimeEnvironmentsPane.c3d772c514',
-                    'orca://pair?code=...'
+                    'Paste token'
                   )}
                   className="h-8 min-w-0 font-mono text-xs"
+                  spellCheck={false}
                 />
                 <p id="runtime-server-pairing-code-help" className="text-xs text-muted-foreground">
-                  {translate('auto.components.settings.RuntimeEnvironmentsPane.163671f7b5', 'Run')}
-                  <span className="font-mono">
-                    {translate(
-                      'auto.components.settings.RuntimeEnvironmentsPane.960e901ae4',
-                      'orca serve --pairing-address <host>'
-                    )}
-                  </span>{' '}
                   {translate(
-                    'auto.components.settings.RuntimeEnvironmentsPane.55fcc964cd',
-                    'on the server and paste the printed pairing URL.'
+                    'auto.components.settings.RuntimeEnvironmentsPane.tokenHelp',
+                    'Run orca serve on the server, then copy its IP and access token.'
                   )}
                 </p>
               </div>
@@ -840,7 +841,7 @@ export function RuntimeEnvironmentsPane({
               <Button
                 type="submit"
                 size="sm"
-                disabled={isBusy || !name.trim() || !pairingCode.trim()}
+                disabled={isBusy || !name.trim() || !serverAddress.trim() || !pairingCode.trim()}
               >
                 {isSaving ? <Loader2 className="animate-spin" /> : <Plus />}
                 {translate(

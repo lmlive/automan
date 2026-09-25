@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import {
-  encodePairingOffer,
+  createPairingOfferFromAddressAndToken,
   decodePairingOffer,
+  encodePairingOffer,
+  encodePairingToken,
   parsePairingCode,
+  parsePairingToken,
   type PairingOffer
 } from './pairing'
 
@@ -112,5 +115,48 @@ describe('parsePairingCode', () => {
   it('returns null for valid base64 of unrelated JSON', () => {
     const bogus = Buffer.from(JSON.stringify({ hello: 'world' })).toString('base64')
     expect(parsePairingCode(bogus)).toBeNull()
+  })
+})
+
+describe('IP + token pairing', () => {
+  const offer: PairingOffer = {
+    v: 2,
+    endpoint: 'ws://192.168.1.10:6768',
+    deviceToken: 'token-abc',
+    publicKeyB64: 'public-key-base64',
+    scope: 'runtime'
+  }
+
+  it('encodes a compact token and rebuilds the offer from an IP address', () => {
+    const token = encodePairingToken(offer)
+
+    expect(parsePairingToken(token)).toEqual({
+      v: 2,
+      deviceToken: offer.deviceToken,
+      publicKeyB64: offer.publicKeyB64,
+      scope: 'runtime'
+    })
+    expect(createPairingOfferFromAddressAndToken('192.168.1.10', token)).toEqual(offer)
+  })
+
+  it('accepts host:port and full websocket endpoints', () => {
+    const token = encodePairingToken(offer)
+
+    expect(createPairingOfferFromAddressAndToken('devbox.local:7777', token)?.endpoint).toBe(
+      'ws://devbox.local:7777'
+    )
+    expect(
+      createPairingOfferFromAddressAndToken('wss://orca.example.com/ws', token)?.endpoint
+    ).toBe('wss://orca.example.com/ws')
+  })
+
+  it('rejects invalid addresses and tokens', () => {
+    const token = encodePairingToken(offer)
+
+    expect(createPairingOfferFromAddressAndToken('', token)).toBeNull()
+    expect(createPairingOfferFromAddressAndToken('https://orca.example.com', token)?.endpoint).toBe(
+      'wss://orca.example.com/'
+    )
+    expect(createPairingOfferFromAddressAndToken('192.168.1.10', 'not-a-token')).toBeNull()
   })
 })

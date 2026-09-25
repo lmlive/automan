@@ -381,6 +381,7 @@ describe('OrcaRuntimeRpcServer', () => {
     expect(offer.available).toBe(true)
     if (offer.available) {
       expect(offer.endpoint).toContain('100.64.1.20')
+      expect(offer.pairingToken).toBeTruthy()
       const parsed = parsePairingCode(offer.pairingUrl)
       expect(parsed?.endpoint).toBe(offer.endpoint)
       expect(parsed?.deviceToken).toBeTruthy()

@@ -134,6 +134,7 @@ describe('registerMobileHandlers', () => {
     const createPairingOffer = vi.fn().mockReturnValue({
       available: true,
       pairingUrl: 'orca://pair#runtime',
+      pairingToken: 'runtime-token',
       webClientUrl: 'http://100.64.1.20:6768/web-index.html?pairing=runtime',
       endpoint: 'ws://100.64.1.20:6768',
       deviceId: 'runtime-1'
@@ -150,6 +151,7 @@ describe('registerMobileHandlers', () => {
     ).resolves.toEqual({
       available: true,
       pairingUrl: 'orca://pair#runtime',
+      pairingToken: 'runtime-token',
       webClientUrl: 'http://100.64.1.20:6768/web-index.html?pairing=runtime',
       endpoint: 'ws://100.64.1.20:6768',
       deviceId: 'runtime-1'

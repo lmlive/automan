@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { decideWebPairingStartup, parseWebPairingInput, type WebPairingOffer } from './web-pairing'
+import {
+  createWebPairingOfferFromAddressAndToken,
+  decideWebPairingStartup,
+  encodeWebPairingToken,
+  parseWebPairingInput,
+  parseWebPairingToken,
+  type WebPairingOffer
+} from './web-pairing'
 
 describe('web pairing input', () => {
   const offer: WebPairingOffer = {
@@ -76,5 +83,16 @@ describe('web pairing input', () => {
     ).toEqual({
       kind: 'use-stored-environment'
     })
+  })
+
+  it('rebuilds a web pairing offer from address and compact token', () => {
+    const token = encodeWebPairingToken(offer)
+
+    expect(parseWebPairingToken(token)).toEqual({
+      v: 2,
+      deviceToken: 'token',
+      publicKeyB64: 'public-key'
+    })
+    expect(createWebPairingOfferFromAddressAndToken('127.0.0.1', token)).toEqual(offer)
   })
 })

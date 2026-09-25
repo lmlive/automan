@@ -4,14 +4,18 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
-  clearStoredWebRuntimeEnvironment,
   createStoredWebRuntimeEnvironment,
   isMixedContentWebSocket,
   readStoredWebRuntimeEnvironment,
-  saveStoredWebRuntimeEnvironment
+  upsertStoredWebRuntimeEnvironment
 } from './web-runtime-environment'
-import { parseWebPairingInput } from './web-pairing'
+import {
+  createWebPairingOfferFromAddressAndToken,
+  encodeWebPairingToken,
+  parseWebPairingInput
+} from './web-pairing'
 import { WebRuntimeClient } from './web-runtime-client'
+import { setFocusedWebRuntimeEnvironmentId } from './web-runtime-environment-registry'
 import type { RuntimeStatus } from '../../../shared/runtime-types'
 import { translate } from '@/i18n/i18n'
 
@@ -26,16 +30,26 @@ export default function WebConnect({
 }: WebConnectProps): React.JSX.Element {
   const existingEnvironment = readStoredWebRuntimeEnvironment()
   const [name, setName] = useState(existingEnvironment?.name ?? 'Orca Server')
-  const [pairingCode, setPairingCode] = useState(initialPairingInput ?? '')
+  const initialOffer = useMemo(
+    () => (initialPairingInput ? parseWebPairingInput(initialPairingInput) : null),
+    [initialPairingInput]
+  )
+  const [address, setAddress] = useState(initialOffer?.endpoint ?? '')
+  const [pairingToken, setPairingToken] = useState(
+    initialOffer ? encodeWebPairingToken(initialOffer) : ''
+  )
   const [error, setError] = useState<string | null>(null)
   const [connecting, setConnecting] = useState(false)
-  const parsedOffer = useMemo(() => parseWebPairingInput(pairingCode), [pairingCode])
+  const parsedOffer = useMemo(
+    () => createWebPairingOfferFromAddressAndToken(address, pairingToken),
+    [address, pairingToken]
+  )
   const autoConnectAttempted = useRef(false)
 
   const connect = async (): Promise<void> => {
     setError(null)
     if (!parsedOffer) {
-      setError('Enter a valid Orca pairing URL or pairing code.')
+      setError('Enter a valid server address and token.')
       return
     }
     if (parsedOffer.scope === 'mobile') {
@@ -72,11 +86,14 @@ export default function WebConnect({
         )
         return
       }
-      saveStoredWebRuntimeEnvironment({
+      // Why: adding a server must not disturb an already paired one, so this
+      // upserts instead of overwriting a single slot.
+      upsertStoredWebRuntimeEnvironment({
         ...environment,
         runtimeId: response._meta.runtimeId,
         lastUsedAt: Date.now()
       })
+      setFocusedWebRuntimeEnvironmentId(environment.id)
       onConnected()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -99,8 +116,8 @@ export default function WebConnect({
   }, [initialPairingInput, parsedOffer])
 
   const clear = (): void => {
-    clearStoredWebRuntimeEnvironment()
-    setPairingCode('')
+    setAddress('')
+    setPairingToken('')
     setError(null)
   }
 
@@ -118,7 +135,7 @@ export default function WebConnect({
             <p className="mt-1 text-sm leading-5 text-muted-foreground">
               {translate(
                 'auto.web.WebConnect.3affe7de3a',
-                'Paste a pairing URL from an Orca server that this browser can reach.'
+                'Enter the server IP address and access token shown by Orca.'
               )}
             </p>
           </div>
@@ -136,18 +153,34 @@ export default function WebConnect({
           />
         </div>
 
-        <div className="grid gap-2">
-          <Label htmlFor="web-runtime-pairing-code">
-            {translate('auto.web.WebConnect.7a566540de', 'Pairing URL or code')}
-          </Label>
-          <Input
-            id="web-runtime-pairing-code"
-            value={pairingCode}
-            onChange={(event) => setPairingCode(event.target.value)}
-            placeholder={translate('auto.web.WebConnect.27393856e4', 'orca://pair?code=...')}
-            autoComplete="off"
-            spellCheck={false}
-          />
+        <div className="grid gap-2 sm:grid-cols-2">
+          <div className="grid gap-2">
+            <Label htmlFor="web-runtime-address">
+              {translate('auto.web.WebConnect.serverAddress', 'Server IP or address')}
+            </Label>
+            <Input
+              id="web-runtime-address"
+              value={address}
+              onChange={(event) => setAddress(event.target.value)}
+              placeholder={translate('auto.web.WebConnect.addressPlaceholder', '192.168.1.10')}
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </div>
+          <div className="grid gap-2">
+            <Label htmlFor="web-runtime-pairing-token">
+              {translate('auto.web.WebConnect.accessToken', 'Access token')}
+            </Label>
+            <Input
+              id="web-runtime-pairing-token"
+              value={pairingToken}
+              onChange={(event) => setPairingToken(event.target.value)}
+              placeholder={translate('auto.web.WebConnect.tokenPlaceholder', 'Paste token')}
+              autoComplete="off"
+              spellCheck={false}
+              className="font-mono"
+            />
+          </div>
         </div>
 
         {parsedOffer && (
@@ -165,7 +198,7 @@ export default function WebConnect({
         <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between">
           <Button type="button" variant="outline" onClick={clear} className="gap-2">
             <Trash2 size={15} aria-hidden />
-            {translate('auto.web.WebConnect.2cf9e5a294', 'Clear saved server')}
+            {translate('auto.web.WebConnect.2cf9e5a294', 'Clear connection input')}
           </Button>
           <Button
             type="button"

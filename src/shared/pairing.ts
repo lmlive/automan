@@ -3,6 +3,15 @@ import { z } from 'zod'
 export const PAIRING_OFFER_VERSION = 2
 const PairingScopeSchema = z.enum(['mobile', 'runtime'])
 
+export const PairingTokenSchema = z.object({
+  v: z.literal(PAIRING_OFFER_VERSION),
+  deviceToken: z.string().min(1),
+  publicKeyB64: z.string().min(1),
+  scope: PairingScopeSchema.optional()
+})
+
+export type PairingToken = z.infer<typeof PairingTokenSchema>
+
 export const PairingOfferSchema = z.object({
   v: z.literal(PAIRING_OFFER_VERSION),
   endpoint: z.string().min(1),
@@ -17,13 +26,40 @@ export const PairingOfferSchema = z.object({
 
 export type PairingOffer = z.infer<typeof PairingOfferSchema>
 
+export function encodePairingToken(offer: PairingOffer): string {
+  return encodeBase64Url(
+    PairingTokenSchema.parse({
+      v: offer.v,
+      deviceToken: offer.deviceToken,
+      publicKeyB64: offer.publicKeyB64,
+      ...(offer.scope ? { scope: offer.scope } : {})
+    })
+  )
+}
+
+export function parsePairingToken(input: string): PairingToken | null {
+  try {
+    return PairingTokenSchema.parse(decodeBase64Url(input.trim()))
+  } catch {
+    return null
+  }
+}
+
+export function createPairingOfferFromAddressAndToken(
+  address: string,
+  token: string,
+  defaultPort = 6768
+): PairingOffer | null {
+  const endpoint = normalizePairingEndpoint(address, defaultPort)
+  const pairingToken = parsePairingToken(token)
+  if (!endpoint || !pairingToken) {
+    return null
+  }
+  return PairingOfferSchema.parse({ ...pairingToken, endpoint })
+}
+
 export function encodePairingOffer(offer: PairingOffer): string {
-  const json = JSON.stringify(offer)
-  const base64url = Buffer.from(json, 'utf-8')
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '')
+  const base64url = encodeBase64Url(offer)
   // Why: Android camera intents and Expo Router preserve query params more
   // reliably than URL fragments when launching a custom-scheme app.
   return `orca://pair?code=${base64url}`
@@ -78,7 +114,44 @@ export function parsePairingCode(input: string): PairingOffer | null {
 }
 
 function decodePairingBase64(base64url: string): PairingOffer {
+  return PairingOfferSchema.parse(decodeBase64Url(base64url))
+}
+
+function encodeBase64Url(value: unknown): string {
+  return Buffer.from(JSON.stringify(value), 'utf-8')
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '')
+}
+
+function decodeBase64Url(base64url: string): unknown {
   const base64 = base64url.replace(/-/g, '+').replace(/_/g, '/')
-  const json = Buffer.from(base64, 'base64').toString('utf-8')
-  return PairingOfferSchema.parse(JSON.parse(json))
+  return JSON.parse(Buffer.from(base64, 'base64').toString('utf-8'))
+}
+
+function normalizePairingEndpoint(address: string, defaultPort: number): string | null {
+  const trimmed = address.trim()
+  if (!trimmed) {
+    return null
+  }
+  try {
+    const hasProtocol = /^[a-z][a-z\d+.-]*:\/\//i.test(trimmed)
+    const url = new URL(hasProtocol ? trimmed : `ws://${trimmed}`)
+    if (url.protocol === 'http:') {
+      url.protocol = 'ws:'
+    } else if (url.protocol === 'https:') {
+      url.protocol = 'wss:'
+    }
+    if (url.protocol !== 'ws:' && url.protocol !== 'wss:') {
+      return null
+    }
+    if (!hasProtocol && !url.port) {
+      url.port = String(defaultPort)
+    }
+    const endpoint = url.toString()
+    return hasProtocol ? endpoint : endpoint.replace(/\/$/, '')
+  } catch {
+    return null
+  }
 }

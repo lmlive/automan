@@ -10,6 +10,23 @@ export type WebPairingOffer = {
   scope?: DeviceScope
 }
 
+export type WebPairingToken = Omit<WebPairingOffer, 'endpoint'>
+
+export function encodeWebPairingToken(offer: WebPairingOffer): string {
+  const token: WebPairingToken = {
+    v: offer.v,
+    deviceToken: offer.deviceToken,
+    publicKeyB64: offer.publicKeyB64,
+    ...(offer.scope ? { scope: offer.scope } : {})
+  }
+  const bytes = new TextEncoder().encode(JSON.stringify(token))
+  let binary = ''
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte)
+  }
+  return globalThis.btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
 export type WebPairingStartupDecision =
   | { kind: 'auto-save-runtime-offer'; offer: WebPairingOffer }
   | { kind: 'show-connect'; initialPairingInput: string | null }
@@ -30,6 +47,42 @@ export function parseWebPairingInput(input: string): WebPairingOffer | null {
   } catch {
     return null
   }
+}
+
+export function parseWebPairingToken(input: string): WebPairingToken | null {
+  try {
+    const parsed = JSON.parse(
+      new TextDecoder().decode(base64UrlToBytes(input.trim()))
+    ) as Partial<WebPairingToken>
+    if (
+      parsed.v !== PAIRING_OFFER_VERSION ||
+      typeof parsed.deviceToken !== 'string' ||
+      parsed.deviceToken.length === 0 ||
+      typeof parsed.publicKeyB64 !== 'string' ||
+      parsed.publicKeyB64.length === 0
+    ) {
+      return null
+    }
+    const scope = parseWebPairingScope(parsed.scope)
+    return {
+      v: PAIRING_OFFER_VERSION,
+      deviceToken: parsed.deviceToken,
+      publicKeyB64: parsed.publicKeyB64,
+      ...(scope ? { scope } : {})
+    }
+  } catch {
+    return null
+  }
+}
+
+export function createWebPairingOfferFromAddressAndToken(
+  address: string,
+  token: string,
+  defaultPort = 6768
+): WebPairingOffer | null {
+  const endpoint = normalizePairingEndpoint(address, defaultPort)
+  const pairingToken = parseWebPairingToken(token)
+  return endpoint && pairingToken ? { ...pairingToken, endpoint } : null
 }
 
 export function readPairingInputFromLocation(location: Location): string | null {
@@ -153,4 +206,26 @@ function normalizeWebSocketEndpoint(endpoint: string): string {
     return `wss://${endpoint.slice('https://'.length)}`
   }
   return endpoint
+}
+
+function normalizePairingEndpoint(address: string, defaultPort: number): string | null {
+  const trimmed = address.trim()
+  if (!trimmed) {
+    return null
+  }
+  try {
+    const hasProtocol = /^[a-z][a-z\d+.-]*:\/\//i.test(trimmed)
+    const url = new URL(hasProtocol ? trimmed : `ws://${trimmed}`)
+    url.protocol = normalizeWebSocketEndpoint(`${url.protocol}//`).slice(0, -2)
+    if (url.protocol !== 'ws:' && url.protocol !== 'wss:') {
+      return null
+    }
+    if (!hasProtocol && !url.port) {
+      url.port = String(defaultPort)
+    }
+    const endpoint = url.toString()
+    return hasProtocol ? endpoint : endpoint.replace(/\/$/, '')
+  } catch {
+    return null
+  }
 }

@@ -14,11 +14,13 @@ const LOOPBACK_ADDRESS = '127.0.0.1'
 const runtimePairingUrlCache: {
   selectedAddress: string
   runtimePairingUrl: string | null
+  runtimePairingToken: string | null
   webClientUrl: string | null
   runtimePairingDeviceId: string | null
 } = {
   selectedAddress: LOOPBACK_ADDRESS,
   runtimePairingUrl: null,
+  runtimePairingToken: null,
   webClientUrl: null,
   runtimePairingDeviceId: null
 }
@@ -40,6 +42,9 @@ export function RuntimePairingUrlGenerator({
   const [selectedAddress, setSelectedAddress] = useState(runtimePairingUrlCache.selectedAddress)
   const [runtimePairingUrl, setRuntimePairingUrl] = useState<string | null>(
     runtimePairingUrlCache.runtimePairingUrl
+  )
+  const [runtimePairingToken, setRuntimePairingToken] = useState<string | null>(
+    runtimePairingUrlCache.runtimePairingToken
   )
   const [webClientUrl, setWebClientUrl] = useState<string | null>(
     runtimePairingUrlCache.webClientUrl
@@ -163,10 +168,12 @@ export function RuntimePairingUrlGenerator({
 
   const clearGeneratedUrls = (): void => {
     runtimePairingUrlCache.runtimePairingUrl = null
+    runtimePairingUrlCache.runtimePairingToken = null
     runtimePairingUrlCache.webClientUrl = null
     runtimePairingUrlCache.runtimePairingDeviceId = null
     if (mountedRef.current) {
       setRuntimePairingUrl(null)
+      setRuntimePairingToken(null)
       setWebClientUrl(null)
       setRuntimePairingDeviceId(null)
     }
@@ -192,10 +199,12 @@ export function RuntimePairingUrlGenerator({
         return
       }
       runtimePairingUrlCache.runtimePairingUrl = result.pairingUrl
+      runtimePairingUrlCache.runtimePairingToken = result.pairingToken
       runtimePairingUrlCache.webClientUrl = result.webClientUrl
       runtimePairingUrlCache.runtimePairingDeviceId = result.deviceId
       if (mountedRef.current) {
         setRuntimePairingUrl(result.pairingUrl)
+        setRuntimePairingToken(result.pairingToken)
         setWebClientUrl(result.webClientUrl)
         setRuntimePairingDeviceId(result.deviceId)
       }
@@ -209,7 +218,7 @@ export function RuntimePairingUrlGenerator({
               )
             : translate(
                 'auto.components.settings.RuntimePairingUrlGenerator.11d5248e62',
-                'Generated pairing URL.'
+                'Generated access token.'
               )
         )
       }
@@ -220,7 +229,7 @@ export function RuntimePairingUrlGenerator({
             ? error.message
             : translate(
                 'auto.components.settings.RuntimePairingUrlGenerator.2ed55c841a',
-                'Failed to generate pairing URL.'
+                'Failed to generate access token.'
               )
         )
       }
@@ -301,7 +310,7 @@ export function RuntimePairingUrlGenerator({
               )
             : translate(
                 'auto.components.settings.RuntimePairingUrlGenerator.df0aa45a86',
-                'Copied pairing URL.'
+                'Copied access token.'
               )
         )
       }
@@ -356,6 +365,7 @@ export function RuntimePairingUrlGenerator({
           isGeneratingPairing={isGeneratingPairing}
           webClientUrl={webClientUrl}
           runtimePairingUrl={runtimePairingUrl}
+          runtimePairingToken={runtimePairingToken}
           copiedTarget={copiedTarget}
           onSelectedAddressChange={updateSelectedAddress}
           onRefreshNetworkInterfaces={() => void loadNetworkInterfaces({ showToastOnError: true })}
