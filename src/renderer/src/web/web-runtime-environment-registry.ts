@@ -25,6 +25,7 @@ let focusedEnvironmentId: string | null = null
 // Why: one socket per paired server. Sharing a single client made every call —
 // including subscriptions and status probes — go to whichever server was added last.
 const clientsByEnvironmentId = new Map<string, WebRuntimeClient>()
+const focusChangeListeners = new Set<(environmentId: string | null) => void>()
 const runtimeCallQueuePool = new RuntimeRpcCallQueuePool()
 const FOCUSED_ENVIRONMENT_STORAGE_KEY = 'orca.web.activeRuntimeEnvironmentId.v1'
 const NO_FOCUSED_ENVIRONMENT = '__none__'
@@ -60,9 +61,30 @@ export function getFocusedWebRuntimeEnvironmentId(): string | null {
 
 export function setFocusedWebRuntimeEnvironmentId(environmentId: string | null): void {
   installWebRuntimeEnvironmentRegistry()
+  applyFocusedWebRuntimeEnvironmentId(environmentId)
+}
+
+function applyFocusedWebRuntimeEnvironmentId(environmentId: string | null): void {
   const next = environmentId?.trim() || null
-  focusedEnvironmentId = next && storedEnvironments.some((entry) => entry.id === next) ? next : null
+  const resolved = next && storedEnvironments.some((entry) => entry.id === next) ? next : null
+  if (resolved === focusedEnvironmentId) {
+    persistFocusedEnvironmentId(focusedEnvironmentId)
+    return
+  }
+  focusedEnvironmentId = resolved
   persistFocusedEnvironmentId(focusedEnvironmentId)
+  for (const listener of focusChangeListeners) {
+    listener(focusedEnvironmentId)
+  }
+}
+
+export function onFocusedWebRuntimeEnvironmentChange(
+  listener: (environmentId: string | null) => void
+): () => void {
+  focusChangeListeners.add(listener)
+  return () => {
+    focusChangeListeners.delete(listener)
+  }
 }
 
 export function addWebRuntimeEnvironmentFromPairingCode(args: {
@@ -96,7 +118,7 @@ export function removeWebRuntimeEnvironment(selector: string): StoredWebRuntimeE
   closeWebRuntimeClient(environment.id)
   removeStoredWebRuntimeEnvironment(environment.id)
   storedEnvironments = readStoredWebRuntimeEnvironments()
-  focusedEnvironmentId = resolveEffectiveFocusId(storedEnvironments, focusedEnvironmentId)
+  applyFocusedWebRuntimeEnvironmentId(resolveEffectiveFocusId(storedEnvironments, focusedEnvironmentId))
   return environment
 }
 

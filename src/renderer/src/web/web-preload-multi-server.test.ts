@@ -136,6 +136,62 @@ describe('web preload multi-server environments', () => {
     )
   })
 
+  it('routes SSH host management through the focused runtime', async () => {
+    const { WebRuntimeClient } = await import('./web-runtime-client')
+    vi.spyOn(
+      WebRuntimeClient.prototype as unknown as { openConnection: () => void },
+      'openConnection'
+    ).mockImplementation(() => undefined)
+    const target = {
+      id: 'ssh-1',
+      label: 'Build server',
+      host: 'builder.test',
+      port: 22,
+      username: 'dev'
+    }
+    const callSpy = vi.spyOn(WebRuntimeClient.prototype, 'call').mockImplementation((async (
+      method: string
+    ) => {
+      if (method === 'ssh.addTarget') {
+        return { ok: true, result: { target }, _meta: { runtimeId: 'runtime-a' } }
+      }
+      if (method === 'ssh.listTargets') {
+        return { ok: true, result: { targets: [target] }, _meta: { runtimeId: 'runtime-a' } }
+      }
+      if (method === 'ssh.connect') {
+        return {
+          ok: true,
+          result: { state: { status: 'connected', connectedAt: 1, reconnectAttempt: 0 } },
+          _meta: { runtimeId: 'runtime-a' }
+        }
+      }
+      throw new Error(`Unexpected method: ${method}`)
+    }) as typeof WebRuntimeClient.prototype.call)
+    const { installWebPreloadApi } = await import('./web-preload-api')
+    installWebPreloadApi()
+    const api = (window as unknown as { api: PreloadApi }).api
+    const added = await api.runtimeEnvironments.addFromPairingCode({
+      name: 'Server A',
+      pairingCode: pairingCode('ws://a.test/rpc', 'token-a')
+    })
+    await api.settings.set({ activeRuntimeEnvironmentId: added.environment.id })
+
+    await expect(
+      api.ssh.addTarget({
+        target: { label: 'Build server', host: 'builder.test', port: 22, username: 'dev' }
+      })
+    ).resolves.toEqual(target)
+    await expect(api.ssh.listTargets()).resolves.toEqual([target])
+    await expect(api.ssh.connect({ targetId: 'ssh-1' })).resolves.toMatchObject({
+      status: 'connected'
+    })
+    expect(callSpy).toHaveBeenCalledWith(
+      'ssh.connect',
+      { targetId: 'ssh-1' },
+      { timeoutMs: 10 * 60_000 }
+    )
+  })
+
   it('removes only the selected server after focus has been cleared', async () => {
     const { installWebPreloadApi } = await import('./web-preload-api')
     installWebPreloadApi()

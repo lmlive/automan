@@ -67,7 +67,7 @@ describe('settings navigation metadata', () => {
     const webIds = ids({ isWebClient: true })
 
     expect(webIds).not.toContain('browser')
-    expect(webIds).not.toContain('ssh')
+    expect(webIds).toContain('ssh')
     expect(webIds).not.toContain('mobile')
     expect(webIds).not.toContain('computer-use')
     expect(webIds).not.toContain('voice')

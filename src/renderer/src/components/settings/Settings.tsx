@@ -1527,19 +1527,17 @@ function Settings(): React.JSX.Element {
                   ) : null}
                 </SettingsSection>
 
-                {showDesktopOnlySettings ? (
-                  <SettingsSection
-                    id="ssh"
-                    title={translate('auto.components.settings.Settings.9b02492d1f', 'SSH Hosts')}
-                    description={translate(
-                      'auto.components.settings.Settings.c2ee313198',
-                      'Use existing machines over SSH for files, terminals, Git, and workspaces.'
-                    )}
-                    searchEntries={getSectionSearchEntries('ssh')}
-                  >
-                    {isSectionMounted('ssh') ? <SshPane /> : null}
-                  </SettingsSection>
-                ) : null}
+                <SettingsSection
+                  id="ssh"
+                  title={translate('auto.components.settings.Settings.9b02492d1f', 'SSH Hosts')}
+                  description={translate(
+                    'auto.components.settings.Settings.c2ee313198',
+                    'Use existing machines over SSH for files, terminals, Git, and workspaces.'
+                  )}
+                  searchEntries={getSectionSearchEntries('ssh')}
+                >
+                  {isSectionMounted('ssh') ? <SshPane /> : null}
+                </SettingsSection>
 
                 {showDesktopOnlySettings && isMac ? (
                   <SettingsSection

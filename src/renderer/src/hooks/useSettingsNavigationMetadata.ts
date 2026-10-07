@@ -430,21 +430,17 @@ export function buildSettingsNavigationMetadata({
       searchEntries: getStatsPaneSearchEntries(),
       group: 'interface'
     },
-    ...(showDesktopOnlySettings
-      ? [
-          {
-            id: 'ssh',
-            title: translate('auto.hooks.useSettingsNavigationMetadata.94a5afe910', 'SSH Hosts'),
-            description: translate(
-              'auto.hooks.useSettingsNavigationMetadata.31e57d1c70',
-              'Use existing machines over SSH for files, terminals, Git, and workspaces.'
-            ),
-            icon: Cable,
-            searchEntries: getSshPaneSearchEntries(),
-            group: 'remote'
-          }
-        ]
-      : []),
+    {
+      id: 'ssh',
+      title: translate('auto.hooks.useSettingsNavigationMetadata.94a5afe910', 'SSH Hosts'),
+      description: translate(
+        'auto.hooks.useSettingsNavigationMetadata.31e57d1c70',
+        'Use existing machines over SSH for files, terminals, Git, and workspaces.'
+      ),
+      icon: Cable,
+      searchEntries: getSshPaneSearchEntries(),
+      group: 'remote'
+    },
     {
       id: 'servers',
       title: translate(

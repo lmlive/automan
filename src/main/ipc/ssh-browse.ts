@@ -41,6 +41,43 @@ class RemoteBrowseError extends Error {
 // registered until a repo is added. This handler uses a raw SSH exec channel
 // to list directories, allowing the user to browse the remote filesystem
 // during the "add remote project" flow before any roots exist.
+export async function browseSshDirectory(
+  getConnectionManager: () => SshConnectionManager | null,
+  args: { targetId: string; dirPath: string }
+): Promise<{ entries: RemoteDirEntry[]; resolvedPath: string }> {
+  const mgr = getConnectionManager()
+  if (!mgr) {
+    throw new Error('SSH connection manager not initialized')
+  }
+  const conn = mgr.getConnection(args.targetId)
+  if (!conn) {
+    throw new Error(`SSH connection "${args.targetId}" not found`)
+  }
+
+  try {
+    return await browseWithPosixShell(conn, args.dirPath)
+  } catch (posixError) {
+    // Why: a Windows login shell (cmd.exe/PowerShell) rejects Orca's POSIX
+    // `exec` wrapper, and the only locale-independent signal for that is "the
+    // remote command executed and exited non-zero" (RemoteBrowseError). Its
+    // stderr prose is localized, and cmd.exe's 9009 ERRORLEVEL never reaches
+    // us (sshd forwards process exit 1). Transport errors/timeouts aren't
+    // RemoteBrowseErrors, so a dropped connection is never retried as Windows.
+    if (!(posixError instanceof RemoteBrowseError)) {
+      throw posixError
+    }
+    try {
+      return await browseWithWindowsPowerShell(conn, args.dirPath)
+    } catch (fallbackError) {
+      // Why: if the login shell couldn't find powershell.exe (exit 127) the
+      // host isn't Windows — surface the original POSIX failure rather than a
+      // misleading "powershell.exe: not found". Otherwise PowerShell genuinely
+      // ran and its error (e.g. "Cannot find path") is the real cause.
+      throw isPosixCommandNotFound(fallbackError) ? posixError : fallbackError
+    }
+  }
+}
+
 export function registerSshBrowseHandler(
   getConnectionManager: () => SshConnectionManager | null
 ): void {
@@ -51,39 +88,8 @@ export function registerSshBrowseHandler(
     async (
       _event,
       args: { targetId: string; dirPath: string }
-    ): Promise<{ entries: RemoteDirEntry[]; resolvedPath: string }> => {
-      const mgr = getConnectionManager()
-      if (!mgr) {
-        throw new Error('SSH connection manager not initialized')
-      }
-      const conn = mgr.getConnection(args.targetId)
-      if (!conn) {
-        throw new Error(`SSH connection "${args.targetId}" not found`)
-      }
-
-      try {
-        return await browseWithPosixShell(conn, args.dirPath)
-      } catch (posixError) {
-        // Why: a Windows login shell (cmd.exe/PowerShell) rejects Orca's POSIX
-        // `exec` wrapper, and the only locale-independent signal for that is "the
-        // remote command executed and exited non-zero" (RemoteBrowseError). Its
-        // stderr prose is localized, and cmd.exe's 9009 ERRORLEVEL never reaches
-        // us (sshd forwards process exit 1). Transport errors/timeouts aren't
-        // RemoteBrowseErrors, so a dropped connection is never retried as Windows.
-        if (!(posixError instanceof RemoteBrowseError)) {
-          throw posixError
-        }
-        try {
-          return await browseWithWindowsPowerShell(conn, args.dirPath)
-        } catch (fallbackError) {
-          // Why: if the login shell couldn't find powershell.exe (exit 127) the
-          // host isn't Windows — surface the original POSIX failure rather than a
-          // misleading "powershell.exe: not found". Otherwise PowerShell genuinely
-          // ran and its error (e.g. "Cannot find path") is the real cause.
-          throw isPosixCommandNotFound(fallbackError) ? posixError : fallbackError
-        }
-      }
-    }
+    ): Promise<{ entries: RemoteDirEntry[]; resolvedPath: string }> =>
+      browseSshDirectory(getConnectionManager, args)
   )
 }
 

@@ -129,4 +129,13 @@ describe('mobile RPC allowlist', () => {
 
     expect(missing).toEqual([])
   })
+
+  it('does not grant mobile tokens SSH host administration', () => {
+    const allowed = mobileRpcAllowlist()
+    const administrativeMethods = [...allowed].filter(
+      (method) => method.startsWith('ssh.') && method !== 'ssh.connect' && method !== 'ssh.getState'
+    )
+
+    expect(administrativeMethods).toEqual([])
+  })
 })

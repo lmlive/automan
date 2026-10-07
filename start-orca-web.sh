@@ -314,8 +314,8 @@ start_services() {
   fi
 
   # 1) Build check
-  if [ ! -f "$SCRIPT_DIR/out/cli/index.js" ] || [ ! -f "$SCRIPT_DIR/out/web/web-index.html" ] || [ ! -f "$SCRIPT_DIR/out/main/index.js" ]; then
-    echo "Build artifacts missing. Run: pnpm run build:cli && pnpm run build:electron-vite && pnpm run build:web" >&2
+  if [ ! -f "$SCRIPT_DIR/out/cli/index.js" ] || [ ! -f "$SCRIPT_DIR/out/web/web-index.html" ] || [ ! -f "$SCRIPT_DIR/out/main/index.js" ] || [ ! -f "$SCRIPT_DIR/out/relay/linux-x64/relay.js" ]; then
+    echo "Build artifacts missing. Run: pnpm run build:relay && pnpm run build:cli && pnpm run build:electron-vite && pnpm run build:web" >&2
     exit 1
   fi
 
@@ -344,7 +344,9 @@ start_services() {
 
   # 2) Start Orca server in background with xvfb-run (nohup protects from SIGHUP on session close)
   echo "[orca] Starting Orca server on ws://0.0.0.0:${ORCA_SERVE_PORT} ..."
-  nohup xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+  # Why: dev-mode Electron's app path can resolve to the Electron binary bundle,
+  # so point SSH deploy at this worktree's relay packages explicitly.
+  ORCA_RELAY_PATH="$SCRIPT_DIR/out/relay" nohup xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
     "$SCRIPT_DIR/node_modules/.bin/electron" \
     --no-sandbox \
     "$SCRIPT_DIR/out/main/index.js" \

@@ -10,6 +10,7 @@ import { SshPortForwardManager } from '../ssh/ssh-port-forward'
 import type {
   DetectedPort,
   EnrichedDetectedPort,
+  PortForwardEntry,
   SavedPortForward,
   SshTarget,
   SshConnectionStatus,
@@ -21,7 +22,7 @@ import { isAuthError } from '../ssh/ssh-connection-utils'
 import { forceStopRelayForTarget } from '../ssh/ssh-relay-reset'
 import { isSshPtyNotFoundError } from '../providers/ssh-pty-provider'
 import { toAppSshPtyId, toRelaySshPtyId } from '../providers/ssh-pty-id'
-import { registerSshBrowseHandler } from './ssh-browse'
+import { registerSshBrowseHandler, browseSshDirectory } from './ssh-browse'
 import {
   getConnectionIdsForWorktree,
   enrichSshDetectedPorts,
@@ -29,7 +30,19 @@ import {
   getWorktreeIdsForConnection
 } from '../ports/ssh-advertised-url-enrichment'
 import { advertisedUrlWatcher } from '../ports/advertised-url-watcher'
-import { requestCredential, registerCredentialHandler } from './ssh-passphrase'
+import {
+  requestCredential,
+  registerCredentialHandler,
+  resolveCredentialRequest
+} from './ssh-passphrase'
+import { emitSshRuntimeEvent } from './ssh-runtime-events'
+import {
+  registerSshOperations,
+  clearSshOperations,
+  type SshAddPortForwardArgs,
+  type SshTestConnectionResult,
+  type SshUpdatePortForwardArgs
+} from './ssh-operations'
 import {
   clearProviderPtyState,
   deletePtyOwnership,
@@ -234,11 +247,13 @@ function broadcastSshState(
   if (isRuntimeOwnedSshTargetId(targetId)) {
     return
   }
+  const publicState = withSshRemotePlatform(targetId, state)
+  emitSshRuntimeEvent({ type: 'stateChanged', targetId, state: publicState })
   const win = getMainWindow()
   if (win && !win.isDestroyed()) {
     win.webContents.send('ssh:state-changed', {
       targetId,
-      state: withSshRemotePlatform(targetId, state)
+      state: publicState
     })
   }
 }
@@ -270,13 +285,15 @@ function getPublicSshState(targetId: string): SshConnectionState | undefined {
 }
 
 function broadcastPortForwards(getMainWindow: () => BrowserWindow | null, targetId: string): void {
+  const forwards = listForwardsEnriched(targetId)
+  emitSshRuntimeEvent({ type: 'portForwardsChanged', targetId, forwards })
   const win = getMainWindow()
   if (!win || win.isDestroyed()) {
     return
   }
   win.webContents.send('ssh:port-forwards-changed', {
     targetId,
-    forwards: listForwardsEnriched(targetId)
+    forwards
   })
 }
 
@@ -286,13 +303,15 @@ function broadcastDetectedPorts(
   ports: DetectedPort[],
   options?: Parameters<typeof enrichSshDetectedPorts>[3]
 ): void {
+  const enriched = enrichDetected(targetId, ports, options)
+  emitSshRuntimeEvent({ type: 'detectedPortsChanged', targetId, ports: enriched })
   const win = getMainWindow()
   if (!win || win.isDestroyed()) {
     return
   }
   win.webContents.send('ssh:detected-ports-changed', {
     targetId,
-    ports: enrichDetected(targetId, ports, options)
+    ports: enriched
   })
 }
 
@@ -845,19 +864,15 @@ export function registerSshHandlers(
       // state is stuck there. Send `connected` directly to the renderer
       // instead of going through callbacks.onStateChange, which would
       // trigger the reconnection logic.
-      const win = getCurrentMainWindow()
-      if (win && !win.isDestroyed()) {
-        clearRelayStateOverride(targetId)
-        win.webContents.send('ssh:state-changed', {
-          targetId,
-          state: withSshRemotePlatform(targetId, {
-            targetId,
-            status: 'connected',
-            error: null,
-            reconnectAttempt: 0
-          })
-        })
-      }
+      clearRelayStateOverride(targetId)
+      // Why: broadcastSshState, not a window-gated send — headless `orca serve`
+      // has no window but still must push `connected` to paired web clients.
+      broadcastSshState(getCurrentMainWindow, targetId, {
+        targetId,
+        status: 'connected',
+        error: null,
+        reconnectAttempt: 0
+      })
     } catch (err) {
       // Relay deployment failed — disconnect SSH
       activeSessions.delete(targetId)
@@ -881,23 +896,23 @@ export function registerSshHandlers(
     await disconnectRegisteredSshTarget(args.targetId)
   })
 
-  ipcMain.handle('ssh:terminateSessions', async (_event, args: { targetId: string }) => {
-    const session = activeSessions.get(args.targetId)
-    const provider = getSshPtyProvider(args.targetId)
+  async function terminateSessions(targetId: string): Promise<void> {
+    const session = activeSessions.get(targetId)
+    const provider = getSshPtyProvider(targetId)
     const leasedIds = persistedStore!
-      .getSshRemotePtyLeases(args.targetId)
+      .getSshRemotePtyLeases(targetId)
       .filter((lease) => lease.state !== 'terminated' && lease.state !== 'expired')
       .map((lease) => lease.ptyId)
     const ptyIdsByRelayId = new Map<string, string>()
-    for (const ptyId of getPtyIdsForConnection(args.targetId)) {
-      const relayPtyId = toRelaySshPtyId(args.targetId, ptyId)
-      ptyIdsByRelayId.set(relayPtyId, toAppSshPtyId(args.targetId, ptyId))
+    for (const ptyId of getPtyIdsForConnection(targetId)) {
+      const relayPtyId = toRelaySshPtyId(targetId, ptyId)
+      ptyIdsByRelayId.set(relayPtyId, toAppSshPtyId(targetId, ptyId))
     }
     for (const ptyId of leasedIds) {
-      const relayPtyId = toRelaySshPtyId(args.targetId, ptyId)
+      const relayPtyId = toRelaySshPtyId(targetId, ptyId)
       ptyIdsByRelayId.set(
         relayPtyId,
-        ptyIdsByRelayId.get(relayPtyId) ?? toAppSshPtyId(args.targetId, ptyId)
+        ptyIdsByRelayId.get(relayPtyId) ?? toAppSshPtyId(targetId, ptyId)
       )
     }
     const ptyIds = Array.from(ptyIdsByRelayId, ([relayPtyId, appPtyId]) => ({
@@ -928,7 +943,7 @@ export function registerSshHandlers(
       }
       clearProviderPtyState(appPtyId)
       deletePtyOwnership(appPtyId)
-      persistedStore!.markSshRemotePtyLease(args.targetId, relayPtyId, 'terminated')
+      persistedStore!.markSshRemotePtyLease(targetId, relayPtyId, 'terminated')
     }
     if (shutdownFailures.length > 0) {
       // Why: a failed relay shutdown can leave the remote process alive in the
@@ -936,13 +951,17 @@ export function registerSshHandlers(
       throw new Error(`Failed to terminate SSH host sessions: ${shutdownFailures.join('; ')}`)
     }
     if (session) {
-      await portForwardManager!.removeAllForwards(args.targetId)
+      await portForwardManager!.removeAllForwards(targetId)
       session.dispose()
-      activeSessions.delete(args.targetId)
-      clearRelayLostBackoff(args.targetId)
-      clearRelayStateOverride(args.targetId)
+      activeSessions.delete(targetId)
+      clearRelayLostBackoff(targetId)
+      clearRelayStateOverride(targetId)
     }
-    await connectionManager!.disconnect(args.targetId)
+    await connectionManager!.disconnect(targetId)
+  }
+
+  ipcMain.handle('ssh:terminateSessions', async (_event, args: { targetId: string }) => {
+    await terminateSessions(args.targetId)
   })
 
   async function doResetRelay(targetId: string, target: SshTarget): Promise<void> {
@@ -995,27 +1014,34 @@ export function registerSshHandlers(
     }
   }
 
-  ipcMain.handle('ssh:resetRelay', (_event, args: { targetId: string }) => {
-    const existingReset = resetRelayInFlight.get(args.targetId)
+  // Why: not `async` — the duplicate-reset dedupe contract requires returning the
+  // SAME promise for a concurrent call for the same target (an async wrapper
+  // would hand back a fresh promise and re-enter doResetRelay).
+  function resetRelay(targetId: string): Promise<void> {
+    const existingReset = resetRelayInFlight.get(targetId)
     if (existingReset) {
       return existingReset
     }
 
-    const target = sshStore!.getTarget(args.targetId)
+    const target = sshStore!.getTarget(targetId)
     if (!target) {
-      throw new Error(`SSH target "${args.targetId}" not found`)
+      throw new Error(`SSH target "${targetId}" not found`)
     }
 
     let resetPromise: Promise<void>
     resetPromise = Promise.resolve()
-      .then(() => doResetRelay(args.targetId, target))
+      .then(() => doResetRelay(targetId, target))
       .finally(() => {
-        if (resetRelayInFlight.get(args.targetId) === resetPromise) {
-          resetRelayInFlight.delete(args.targetId)
+        if (resetRelayInFlight.get(targetId) === resetPromise) {
+          resetRelayInFlight.delete(targetId)
         }
       })
-    resetRelayInFlight.set(args.targetId, resetPromise)
+    resetRelayInFlight.set(targetId, resetPromise)
     return resetPromise
+  }
+
+  ipcMain.handle('ssh:resetRelay', (_event, args: { targetId: string }) => {
+    return resetRelay(args.targetId)
   })
 
   ipcMain.handle('ssh:getState', (_event, args: { targetId: string }) => {
@@ -1028,19 +1054,23 @@ export function registerSshHandlers(
   // the user expects to enter the credential before the app starts connecting.
   // Returns true if the target's last successful connect required a credential
   // AND the live SshConnection (if any) does not already have one cached.
-  ipcMain.handle('ssh:needsPassphrasePrompt', (_event, args: { targetId: string }) => {
-    const target = sshStore!.getTarget(args.targetId)
+  function needsPassphrasePrompt(targetId: string): boolean {
+    const target = sshStore!.getTarget(targetId)
     if (!target?.lastRequiredPassphrase) {
       return false
     }
-    const conn = connectionManager!.getConnection(args.targetId)
+    const conn = connectionManager!.getConnection(targetId)
     return !conn?.hasCachedCredential()
+  }
+
+  ipcMain.handle('ssh:needsPassphrasePrompt', (_event, args: { targetId: string }) => {
+    return needsPassphrasePrompt(args.targetId)
   })
 
-  ipcMain.handle('ssh:testConnection', async (_event, args: { targetId: string }) => {
-    const target = sshStore!.getTarget(args.targetId)
+  async function testConnection(targetId: string): Promise<SshTestConnectionResult> {
+    const target = sshStore!.getTarget(targetId)
     if (!target) {
-      throw new Error(`SSH target "${args.targetId}" not found`)
+      throw new Error(`SSH target "${targetId}" not found`)
     }
 
     // Why: testConnection calls connect() then disconnect(). If the target
@@ -1049,20 +1079,20 @@ export function registerSshHandlers(
     // active PTYs and file watchers for a "test" that was supposed to be safe.
     // Also guard 'reconnecting' — disconnect() would kill the SSH connection
     // that the in-flight reconnect is using for relay deployment.
-    const existingSession = activeSessions.get(args.targetId)
+    const existingSession = activeSessions.get(targetId)
     const sessionState = existingSession?.getState()
     if (
       sessionState === 'ready' ||
       sessionState === 'deploying' ||
       sessionState === 'reconnecting'
     ) {
-      return { success: true, state: connectionManager!.getState(args.targetId) }
+      return { success: true, state: connectionManager!.getState(targetId) ?? undefined }
     }
 
     // Why: if a real ssh:connect is in flight for this target, testConnection's
     // disconnect() call would tear down the connection that doConnect is using
     // for relay deployment. Wait for the in-flight connect to finish instead.
-    const inFlight = connectInFlight.get(args.targetId)
+    const inFlight = connectInFlight.get(targetId)
     if (inFlight) {
       try {
         const state = await inFlight
@@ -1075,11 +1105,11 @@ export function registerSshHandlers(
       }
     }
 
-    testingTargets.add(args.targetId)
+    testingTargets.add(targetId)
     try {
       const conn = await connectionManager!.connect(target)
       const state = conn.getState()
-      await connectionManager!.disconnect(args.targetId)
+      await connectionManager!.disconnect(targetId)
       return { success: true, state }
     } catch (err) {
       return {
@@ -1087,111 +1117,134 @@ export function registerSshHandlers(
         error: err instanceof Error ? err.message : String(err)
       }
     } finally {
-      testingTargets.delete(args.targetId)
+      testingTargets.delete(targetId)
       // Why: the shared onCredentialRequest callback adds to this set for
       // any connect() call, including testConnection. Without clearing it,
       // a later real connect that doesn't prompt would persist
       // lastRequiredPassphrase=true, causing startup to defer this target.
-      credentialRequestedForTarget.delete(args.targetId)
+      credentialRequestedForTarget.delete(targetId)
     }
+  }
+
+  ipcMain.handle('ssh:testConnection', async (_event, args: { targetId: string }) => {
+    return testConnection(args.targetId)
   })
 
   // ── Port forwarding ─────────────────────────────────────────────────
 
-  ipcMain.handle(
-    'ssh:addPortForward',
-    async (
-      _event,
-      args: {
-        targetId: string
-        localPort: number
-        remoteHost: string
-        remotePort: number
-        label?: string
-      }
-    ) => {
-      const conn = connectionManager!.getConnection(args.targetId)
-      if (!conn) {
-        throw new Error(`SSH connection "${args.targetId}" not found`)
-      }
-      const entry = await portForwardManager!.addForward(
-        args.targetId,
+  async function addPortForward(args: SshAddPortForwardArgs): Promise<PortForwardEntry> {
+    const conn = connectionManager!.getConnection(args.targetId)
+    if (!conn) {
+      throw new Error(`SSH connection "${args.targetId}" not found`)
+    }
+    const entry = await portForwardManager!.addForward(
+      args.targetId,
+      conn,
+      args.localPort,
+      args.remoteHost,
+      args.remotePort,
+      args.label
+    )
+    persistPortForwards(args.targetId)
+    broadcastPortForwards(getCurrentMainWindow, args.targetId)
+    return entry
+  }
+
+  ipcMain.handle('ssh:addPortForward', async (_event, args: SshAddPortForwardArgs) => {
+    return addPortForward(args)
+  })
+
+  async function updatePortForward(args: SshUpdatePortForwardArgs): Promise<PortForwardEntry> {
+    const conn = connectionManager!.getConnection(args.targetId)
+    if (!conn) {
+      throw new Error(`SSH connection "${args.targetId}" not found`)
+    }
+    try {
+      const entry = await portForwardManager!.updateForward(
+        args.id,
         conn,
         args.localPort,
         args.remoteHost,
         args.remotePort,
         args.label
       )
+      persistPortForwards(entry.connectionId)
+      broadcastPortForwards(getCurrentMainWindow, entry.connectionId)
+      return entry
+    } catch (err) {
+      // Why: if the edit failed (and rollback may also have failed),
+      // sync the renderer with the actual runtime state so it doesn't
+      // show a forward that no longer exists.
       persistPortForwards(args.targetId)
       broadcastPortForwards(getCurrentMainWindow, args.targetId)
-      return entry
+      throw err
     }
-  )
+  }
 
-  ipcMain.handle(
-    'ssh:updatePortForward',
-    async (
-      _event,
-      args: {
-        id: string
-        targetId: string
-        localPort: number
-        remoteHost: string
-        remotePort: number
-        label?: string
-      }
-    ) => {
-      const conn = connectionManager!.getConnection(args.targetId)
-      if (!conn) {
-        throw new Error(`SSH connection "${args.targetId}" not found`)
-      }
-      try {
-        const entry = await portForwardManager!.updateForward(
-          args.id,
-          conn,
-          args.localPort,
-          args.remoteHost,
-          args.remotePort,
-          args.label
-        )
-        persistPortForwards(entry.connectionId)
-        broadcastPortForwards(getCurrentMainWindow, entry.connectionId)
-        return entry
-      } catch (err) {
-        // Why: if the edit failed (and rollback may also have failed),
-        // sync the renderer with the actual runtime state so it doesn't
-        // show a forward that no longer exists.
-        persistPortForwards(args.targetId)
-        broadcastPortForwards(getCurrentMainWindow, args.targetId)
-        throw err
-      }
-    }
-  )
+  ipcMain.handle('ssh:updatePortForward', async (_event, args: SshUpdatePortForwardArgs) => {
+    return updatePortForward(args)
+  })
 
-  ipcMain.handle('ssh:removePortForward', async (_event, args: { id: string }) => {
-    const removed = await portForwardManager!.removeForwardAndWait(args.id)
+  async function removePortForward(id: string): Promise<PortForwardEntry | null> {
+    const removed = await portForwardManager!.removeForwardAndWait(id)
     if (removed) {
       persistPortForwards(removed.connectionId)
       broadcastPortForwards(getCurrentMainWindow, removed.connectionId)
     }
     return removed
+  }
+
+  ipcMain.handle('ssh:removePortForward', async (_event, args: { id: string }) => {
+    return removePortForward(args.id)
   })
 
-  ipcMain.handle('ssh:listPortForwards', (_event, args?: { targetId?: string }) => {
-    const all = portForwardManager!.listForwards(args?.targetId)
-    if (!persistedStore || !args?.targetId) {
+  function listPortForwards(targetId?: string): PortForwardEntry[] {
+    const all = portForwardManager!.listForwards(targetId)
+    if (!persistedStore || !targetId) {
       // Why: the cross-target list is rare and we cannot map every entry to
       // worktrees in a single call; serve the raw list. Per-target callers
       // get full enrichment.
       return all
     }
-    return enrichSshForwardEntries(all, getWorktreeIdsForConnection(persistedStore, args.targetId))
+    return enrichSshForwardEntries(all, getWorktreeIdsForConnection(persistedStore, targetId))
+  }
+
+  ipcMain.handle('ssh:listPortForwards', (_event, args?: { targetId?: string }) => {
+    return listPortForwards(args?.targetId)
   })
 
+  function listDetectedPorts(targetId: string): EnrichedDetectedPort[] {
+    const session = activeSessions.get(targetId)
+    const ports = session?.getPortScanner()?.getDetectedPorts(targetId) ?? []
+    return enrichDetected(targetId, ports)
+  }
+
   ipcMain.handle('ssh:listDetectedPorts', (_event, args: { targetId: string }) => {
-    const session = activeSessions.get(args.targetId)
-    const ports = session?.getPortScanner()?.getDetectedPorts(args.targetId) ?? []
-    return enrichDetected(args.targetId, ports)
+    return listDetectedPorts(args.targetId)
+  })
+
+  // Why: one published operation table serves both the Electron IPC surface
+  // above and the runtime RPC surface web clients use. See ssh-operations.ts.
+  registerSshOperations({
+    listTargets: () => sshStore!.listTargets(),
+    addTarget: (target) => sshStore!.addTarget(target),
+    updateTarget: (id, updates) => sshStore!.updateTarget(id, updates),
+    removeTarget: (id) => removeRegisteredSshTarget(id),
+    importConfig: (args) => sshStore!.importFromSshConfig(args),
+    connect: (targetId) => connectTarget(targetId),
+    disconnect: (targetId) => disconnectRegisteredSshTarget(targetId),
+    terminateSessions,
+    resetRelay,
+    getState: (targetId) => getPublicSshState(targetId),
+    needsPassphrasePrompt,
+    testConnection,
+    addPortForward,
+    updatePortForward,
+    removePortForward,
+    listPortForwards,
+    listDetectedPorts,
+    browseDir: (args) => browseSshDirectory(() => connectionManager, args),
+    submitCredential: (args) => resolveCredentialRequest(args.requestId, args.value)
   })
 
   return { connectionManager, sshStore }
@@ -1232,6 +1285,7 @@ export async function resetSshHandlerStateForTests(): Promise<void> {
   persistedStore = null
   registeredConnectSshTarget = null
   registeredGetSshState = null
+  clearSshOperations()
   currentGetMainWindow = () => null
   currentRuntime = undefined
 }

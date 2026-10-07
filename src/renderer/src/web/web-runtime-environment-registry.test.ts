@@ -91,6 +91,33 @@ describe('web runtime environment registry', () => {
     expect(registry.requireFocusedWebRuntimeEnvironmentOrNull()).toBeNull()
   })
 
+  it('notifies listeners when focus changes', async () => {
+    const registry = await import('./web-runtime-environment-registry')
+    registry.installWebRuntimeEnvironmentRegistry()
+    const listener = vi.fn()
+    const unsubscribe = registry.onFocusedWebRuntimeEnvironmentChange(listener)
+
+    registry.setFocusedWebRuntimeEnvironmentId('web-b')
+
+    expect(listener).toHaveBeenCalledWith('web-b')
+    unsubscribe()
+    registry.setFocusedWebRuntimeEnvironmentId('web-a')
+    expect(listener).toHaveBeenCalledTimes(1)
+  })
+
+  it('notifies listeners and persists replacement focus when the active server is removed', async () => {
+    const registry = await import('./web-runtime-environment-registry')
+    registry.installWebRuntimeEnvironmentRegistry()
+    registry.setFocusedWebRuntimeEnvironmentId('web-a')
+    const listener = vi.fn()
+    registry.onFocusedWebRuntimeEnvironmentChange(listener)
+
+    registry.removeWebRuntimeEnvironment('web-a')
+
+    expect(listener).toHaveBeenCalledWith('web-b')
+    expect(storage.getItem('orca.web.activeRuntimeEnvironmentId.v1')).toBe('web-b')
+  })
+
   it('rejects a duplicate server name', async () => {
     const registry = await import('./web-runtime-environment-registry')
     registry.installWebRuntimeEnvironmentRegistry()

@@ -114,6 +114,7 @@ import {
   assertClipboardImageDimensionsWithinLimit
 } from '../../../shared/clipboard-image'
 import { sanitizeWebRuntimeWorkspaceSession } from './web-workspace-session'
+import { createWebSshApi } from './web-ssh-api'
 import {
   normalizeFeatureInteractions,
   type FeatureInteractionId,
@@ -667,7 +668,7 @@ function createWebPreloadApi(): Partial<PreloadApi> {
     shell: createShellApi(),
     skills: createSkillsApi(),
     pty: createPtyApi(),
-    ssh: createSshApi(),
+    ssh: createWebSshApi(),
     wsl: {
       isAvailable: () => callRuntimeResult<boolean>('host.wsl.isAvailable').catch(() => false),
       listDistros: () => callRuntimeResult<string[]>('host.wsl.listDistros').catch(() => [])
@@ -2634,43 +2635,6 @@ function createPtyApi(): NonNullable<Partial<PreloadApi>['pty']> {
       killOne: () => Promise.resolve({ success: false }),
       restart: () => Promise.resolve({ success: false })
     }
-  }
-}
-
-function createSshApi(): NonNullable<Partial<PreloadApi>['ssh']> {
-  return {
-    listTargets: () => Promise.resolve([]),
-    addTarget: () =>
-      Promise.reject(new Error('SSH target management is unavailable in the web client.')),
-    updateTarget: () =>
-      Promise.reject(new Error('SSH target management is unavailable in the web client.')),
-    removeTarget: () => Promise.resolve(),
-    importConfig: () => Promise.resolve([]),
-    connect: () => Promise.resolve(null),
-    disconnect: () => Promise.resolve(),
-    terminateSessions: () => Promise.resolve(),
-    resetRelay: () => Promise.resolve(),
-    getState: () => Promise.resolve(null),
-    needsPassphrasePrompt: () => Promise.resolve(false),
-    testConnection: () =>
-      Promise.resolve({
-        success: false,
-        error: translate('auto.web.web.preload.api.31bfe8ae1a', 'Unavailable in the web client.')
-      }),
-    onStateChanged: () => noopUnsubscribe,
-    addPortForward: () =>
-      Promise.reject(new Error('SSH port forwarding is unavailable in the web client.')),
-    updatePortForward: () =>
-      Promise.reject(new Error('SSH port forwarding is unavailable in the web client.')),
-    removePortForward: () => Promise.resolve(null),
-    listPortForwards: () => Promise.resolve([]),
-    listDetectedPorts: () => Promise.resolve([]),
-    onPortForwardsChanged: () => noopUnsubscribe,
-    onDetectedPortsChanged: () => noopUnsubscribe,
-    browseDir: () => Promise.resolve({ entries: [], resolvedPath: '' }),
-    onCredentialRequest: () => noopUnsubscribe,
-    onCredentialResolved: () => noopUnsubscribe,
-    submitCredential: () => Promise.resolve()
   }
 }
 

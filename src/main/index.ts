@@ -140,6 +140,7 @@ import {
   getLocalPtyProvider,
   registerHeadlessPtyRuntime
 } from './ipc/pty'
+import { registerSshHandlers } from './ipc/ssh'
 import { AgentBrowserBridge } from './browser/agent-browser-bridge'
 import { EmulatorBridge } from './emulator/emulator-bridge'
 import { serveSimStateWatcher } from './emulator/serve-sim-state-watcher'
@@ -2066,6 +2067,13 @@ app.whenReady().then(async () => {
       (target) => claudeRuntimeAuth!.prepareForClaudeLaunch(target),
       store
     )
+    // Why: headless serve never runs startDesktopFirstWindowStartupServices, so
+    // openMainWindow → attachMainWindowServices (the sole registerSshHandlers
+    // call site) never fires and getSshConnectionStore() stays null — every
+    // ssh.* RPC from a paired web client would throw "SSH handlers are not
+    // registered.". Register here with a null window: broadcasts reach web
+    // clients through the ssh runtime event bus instead of webContents.send.
+    registerSshHandlers(store!, () => null, runtime)
     // Why: headless servers have no renderer to mount <webview> browser panes.
     // Back them with main-process offscreen WebContents instead, so this host can
     // own browser pages and advertise browser.headless.v1 — but only when a
