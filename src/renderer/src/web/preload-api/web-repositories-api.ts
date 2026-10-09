@@ -8,7 +8,7 @@ import {
   withRuntimeRepoMutationOwner,
   withRuntimeRepoOwner
 } from './web-runtime-calls'
-import { assertActiveEnvironment, invalidateRuntimeWorktreeCaches } from './web-runtime-session'
+import { invalidateRuntimeWorktreeCaches } from './web-runtime-session'
 import { noopUnsubscribe } from './web-storage'
 
 export function createReposApi(): NonNullable<Partial<PreloadApi>['repos']> {
@@ -66,24 +66,17 @@ export function createReposApi(): NonNullable<Partial<PreloadApi>['repos']> {
       throw new Error('Creating projects on SSH hosts is unavailable in paired web clients.')
     },
     cloneAbort: () => Promise.resolve(),
-    addRemote: async ({ remotePath, displayName, kind }) => {
+    addRemote: async ({ connectionId, remotePath, displayName, kind }) => {
       invalidateRuntimeWorktreeCaches()
-      const owned = await callRuntimeResultWithOwner<{ repo: Repo }>('repo.add', {
-        path: remotePath,
-        kind
-      })
-      const result = {
-        repo: withRuntimeRepoOwner(owned.result.repo, owned.hostId)
+      const owned = await callRuntimeResultWithOwner<{ repo: Repo } | { error: string }>(
+        'repo.addRemote',
+        { connectionId, remotePath, displayName, kind }
+      )
+      if ('error' in owned.result) {
+        return owned.result
       }
-      if (!displayName) {
-        return result
-      }
-      assertActiveEnvironment(owned.environmentId)
       return {
-        repo: await createReposApi().update({
-          repoId: result.repo.id,
-          updates: { displayName }
-        })
+        repo: withRuntimeRepoOwner(owned.result.repo, owned.hostId)
       }
     },
     create: async ({ parentPath, name, kind }) => {

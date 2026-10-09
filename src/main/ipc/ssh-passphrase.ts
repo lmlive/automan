@@ -1,12 +1,15 @@
 import { ipcMain, type BrowserWindow } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { SSH_CREDENTIAL_TIMEOUT_MS, type SshCredentialKind } from '../ssh/ssh-connection-utils'
+import { emitSshRuntimeEvent } from './ssh-runtime-events'
+
 const pendingRequests = new Map<string, { resolve: (value: string | null) => void }>()
 
 function notifyCredentialResolved(
   getMainWindow: () => BrowserWindow | null,
   requestId: string
 ): void {
+  emitSshRuntimeEvent({ type: 'credentialResolved', requestId })
   const win = getMainWindow()
   if (win && !win.isDestroyed()) {
     win.webContents.send('ssh:credential-resolved', { requestId })
@@ -42,13 +45,16 @@ export function requestCredential(
   }
   signal?.addEventListener('abort', onAbort, { once: true })
 
+  emitSshRuntimeEvent({ type: 'credentialRequest', requestId, targetId, kind, detail })
   const win = getMainWindow()
   if (win && !win.isDestroyed()) {
     win.webContents.send('ssh:credential-request', { requestId, targetId, kind, detail, echo })
-  } else {
-    finish(null)
   }
   return promise
+}
+
+export function resolveCredentialRequest(requestId: string, value: string | null): void {
+  pendingRequests.get(requestId)?.resolve(value)
 }
 
 export function registerCredentialHandler(): void {
@@ -56,7 +62,7 @@ export function registerCredentialHandler(): void {
   ipcMain.handle(
     'ssh:submitCredential',
     (_event, args: { requestId: string; value: string | null }) => {
-      pendingRequests.get(args.requestId)?.resolve(args.value)
+      resolveCredentialRequest(args.requestId, args.value)
     }
   )
 }

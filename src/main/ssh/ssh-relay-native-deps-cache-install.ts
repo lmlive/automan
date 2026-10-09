@@ -10,12 +10,15 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { SshConnection } from './ssh-connection'
+import { getAppEnvironment } from '../../shared/app-environment'
 import { RELAY_ARTIFACTS } from '../../shared/relay-artifacts'
 import { execCommand } from './ssh-relay-deploy-helpers'
 import { NATIVE_DEPS_COMMAND_TIMEOUT_MS } from './ssh-relay-deploy-timing'
 import {
   computeRelayNativeDepsCacheKey,
   supportsRelayNativeDepsCache,
+  relayNativeDepsCacheEntryDir,
+  RELAY_NATIVE_DEPS_CACHE_COMPLETE_NAME,
   RELAY_NATIVE_DEPS_PATCH_ARTIFACT_PATTERN,
   type RelayNativeDepsCachePatchSource
 } from './ssh-relay-native-deps-cache'
@@ -27,7 +30,9 @@ import {
   RELAY_NATIVE_CACHE_SEEDED,
   type RelayNativeDepsCachePaths
 } from './ssh-relay-native-deps-cache-commands'
-import type { RemoteHostPlatform } from './ssh-remote-platform'
+import { joinRemotePath, type RemoteHostPlatform } from './ssh-remote-platform'
+import { shellEscape } from './ssh-connection-utils'
+import { uploadFileViaExecStdin } from './ssh-exec-stdin-file-transfer'
 
 /**
  * `linked` — the relay directory now points at a complete shared entry and needs no install.
@@ -149,6 +154,10 @@ export async function attachRelayNativeDepsCache(
     if (output.includes(RELAY_NATIVE_CACHE_SEEDED)) {
       console.log(`[ssh-relay] Seeded native deps for ${key} from an existing install on this host`)
     }
+    const prebuiltLinked = await trySeedRelayNativeDepsFromLocalPrebuild(conn, context, paths, key)
+    if (prebuiltLinked) {
+      return { mode: 'linked', key }
+    }
     return { mode: 'private', key }
   } catch (err) {
     context.signal?.throwIfAborted()
@@ -206,4 +215,90 @@ function cachePathsFor(
     relayDir: context.relayDir,
     key
   }
+}
+
+function findLocalPrebuiltNativeTarball(context: RelayNativeDepsCacheContext): string | null {
+  if (process.env.NODE_ENV === 'test' || process.env.VITEST) {
+    return null
+  }
+  let root: string | undefined
+  try {
+    root = getAppEnvironment().getAppPath()
+  } catch {
+    root = undefined
+  }
+  const candidates: (string | null | undefined)[] = [
+    process.env.ORCA_RELAY_PREBUILTS_PATH
+      ? join(process.env.ORCA_RELAY_PREBUILTS_PATH, context.platform, 'native-cache.tar.gz')
+      : null,
+    process.resourcesPath
+      ? join(process.resourcesPath, 'relay-prebuilts', context.platform, 'native-cache.tar.gz')
+      : null,
+    root ? join(root, 'config', 'relay-prebuilts', context.platform, 'native-cache.tar.gz') : null,
+    root ? join(root, 'config', 'relay-prebuilts', `native-${context.platform}.tar.gz`) : null,
+    join(process.cwd(), 'config', 'relay-prebuilts', context.platform, 'native-cache.tar.gz'),
+    join(process.cwd(), 'config', 'relay-prebuilts', `native-${context.platform}.tar.gz`)
+  ]
+  for (const candidate of candidates) {
+    if (candidate && existsSync(candidate)) {
+      return candidate
+    }
+  }
+  return null
+}
+
+async function trySeedRelayNativeDepsFromLocalPrebuild(
+  conn: SshConnection,
+  context: RelayNativeDepsCacheContext,
+  paths: RelayNativeDepsCachePaths,
+  key: string
+): Promise<boolean> {
+  const localTarball = findLocalPrebuiltNativeTarball(context)
+  if (!localTarball) {
+    return false
+  }
+  const { hostPlatform, signal } = context
+  const entryDir = relayNativeDepsCacheEntryDir(hostPlatform, context.remoteHome, key)
+  const remoteArchive = joinRemotePath(hostPlatform, entryDir, 'native-cache.tar.gz')
+  const completeFile = joinRemotePath(hostPlatform, entryDir, RELAY_NATIVE_DEPS_CACHE_COMPLETE_NAME)
+  try {
+    console.log(
+      `[ssh-relay] Uploading local prebuilt native deps from ${localTarball} to ${entryDir}...`
+    )
+    await execHostCommand(conn, hostPlatform, `mkdir -p ${shellEscape(entryDir)}`, signal)
+    if (typeof conn.openFileUploadSession === 'function') {
+      const session = await conn.openFileUploadSession({ hostPlatform })
+      try {
+        await session.uploadFile(localTarball, remoteArchive)
+      } finally {
+        session.close()
+      }
+    } else {
+      await uploadFileViaExecStdin(conn, localTarball, remoteArchive, { signal })
+    }
+    await execHostCommand(
+      conn,
+      hostPlatform,
+      `tar -xzf ${shellEscape(remoteArchive)} -C ${shellEscape(entryDir)} && rm -f ${shellEscape(remoteArchive)} && find ${shellEscape(entryDir)} -name spawn-helper -exec chmod +x {} + 2>/dev/null; touch ${shellEscape(completeFile)}`,
+      signal
+    )
+    const verifyOutput = await execHostCommand(
+      conn,
+      hostPlatform,
+      ensureRelayNativeDepsCacheCommand(paths, context.deps),
+      signal
+    )
+    if (verifyOutput.includes(RELAY_NATIVE_CACHE_LINKED)) {
+      console.log(`[ssh-relay] Prebuilt native deps successfully linked for ${key}`)
+      return true
+    }
+  } catch (error) {
+    signal?.throwIfAborted()
+    console.warn(
+      `[ssh-relay] Failed to seed prebuilt native deps for ${key}: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    )
+  }
+  return false
 }

@@ -1,9 +1,6 @@
 import type { PreloadApi } from '../../../../preload/api-types'
 import { EMPTY_PTY_MAIN_DELIVERY_DIAGNOSTICS } from '../../../../shared/pty-delivery-diagnostics'
-import type { SshConnectionState, SshTarget } from '../../../../shared/ssh-types'
-import { translate } from '@/i18n/i18n'
-import { callRuntimeResult } from './web-runtime-calls'
-import { requireActiveEnvironmentOrNull } from './web-runtime-session'
+import { createWebSshApi } from './web-ssh-api'
 import { noopUnsubscribe } from './web-storage'
 
 export function createPtyApi(): NonNullable<Partial<PreloadApi>['pty']> {
@@ -113,80 +110,5 @@ export function createPtyApi(): NonNullable<Partial<PreloadApi>['pty']> {
 }
 
 export function createSshApi(): NonNullable<Partial<PreloadApi>['ssh']> {
-  return {
-    // Why: SSH is owned by the paired host; route read/connect to runtime RPC for state/reconnect (STA-1468). Target mgmt is desktop-only.
-    listTargets: async () => {
-      if (!requireActiveEnvironmentOrNull()) {
-        return []
-      }
-      const { targets } = await callRuntimeResult<{ targets: SshTarget[] }>(
-        'ssh.listTargetSummaries'
-      )
-      return targets
-    },
-    listRemovedTargetLabels: async () => {
-      if (!requireActiveEnvironmentOrNull()) {
-        return {}
-      }
-      const { labels } = await callRuntimeResult<{ labels: Record<string, string> }>(
-        'ssh.listRemovedTargetLabels'
-      )
-      return labels
-    },
-    addTarget: () =>
-      Promise.reject(new Error('SSH target management is unavailable in the web client.')),
-    updateTarget: () =>
-      Promise.reject(new Error('SSH target management is unavailable in the web client.')),
-    removeTarget: () => Promise.resolve(),
-    importConfig: () => Promise.resolve({ targets: [], repoReadoptions: [] }),
-    listConfigHosts: () =>
-      Promise.resolve({
-        hosts: [],
-        totalHostCount: 0,
-        newHostCount: 0,
-        matchCount: 0,
-        hasMore: false
-      }),
-    resolveConfigHost: () => Promise.resolve(null),
-    connect: async (args) => {
-      const { state } = await callRuntimeResult<{ state: SshConnectionState | null }>(
-        'ssh.connect',
-        { targetId: args.targetId }
-      )
-      return state
-    },
-    disconnect: () => Promise.resolve(),
-    terminateSessions: () => Promise.resolve({ terminated: 0, unverifiable: 0 }),
-    resetRelay: () => Promise.resolve(),
-    getState: async (args) => {
-      if (!requireActiveEnvironmentOrNull()) {
-        return null
-      }
-      const { state } = await callRuntimeResult<{ state: SshConnectionState | null }>(
-        'ssh.getState',
-        { targetId: args.targetId }
-      )
-      return state
-    },
-    needsPassphrasePrompt: () => Promise.resolve(false),
-    testConnection: () =>
-      Promise.resolve({
-        success: false,
-        error: translate('auto.web.web.preload.api.31bfe8ae1a', 'Unavailable in the web client.')
-      }),
-    onStateChanged: () => noopUnsubscribe,
-    addPortForward: () =>
-      Promise.reject(new Error('SSH port forwarding is unavailable in the web client.')),
-    updatePortForward: () =>
-      Promise.reject(new Error('SSH port forwarding is unavailable in the web client.')),
-    removePortForward: () => Promise.resolve(null),
-    listPortForwards: () => Promise.resolve([]),
-    listDetectedPorts: () => Promise.resolve([]),
-    onPortForwardsChanged: () => noopUnsubscribe,
-    onDetectedPortsChanged: () => noopUnsubscribe,
-    browseDir: () => Promise.resolve({ entries: [], resolvedPath: '', pathFlavor: 'posix' }),
-    onCredentialRequest: () => noopUnsubscribe,
-    onCredentialResolved: () => noopUnsubscribe,
-    submitCredential: () => Promise.resolve()
-  }
+  return createWebSshApi()
 }

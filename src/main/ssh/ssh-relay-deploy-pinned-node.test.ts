@@ -245,8 +245,8 @@ describe('deployAndLaunchRelay on the pinned Node runtime', () => {
     resetSshRemoteRuntimeTelemetryForTests()
   })
 
-  it('keeps the legacy host-Node path when the host has no runtime setting', async () => {
-    const conn = makeConnection()
+  it('keeps the legacy host-Node path when the host has the legacy runtime setting', async () => {
+    const conn = makeConnection('legacy')
     queueInstalledLegacyLaunch()
 
     const result = await deployAndLaunchRelay(conn, undefined, undefined, 'target-1')
@@ -293,7 +293,7 @@ describe('deployAndLaunchRelay on the pinned Node runtime', () => {
   })
 
   it('leaves the runtime store alone on the legacy host-Node path', async () => {
-    const conn = makeConnection()
+    const conn = makeConnection('legacy')
     queueInstalledLegacyLaunch()
 
     await deployAndLaunchRelay(conn, undefined, undefined, 'target-1')

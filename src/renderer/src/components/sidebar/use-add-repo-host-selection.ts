@@ -57,13 +57,15 @@ export function useAddRepoHostSelection({
       }),
     [ephemeralRuntimeEnvironmentIds, hostOptions, isWebClient]
   )
-  const [selectedAddProjectHostId, setSelectedAddProjectHostId] =
-    useState<ExecutionHostId>(LOCAL_EXECUTION_HOST_ID)
-  const [hostSelectorOpen, setHostSelectorOpen] = useState(false)
-  const previousOpenRef = useRef(false)
+  // Why: must be defined before useState so the lazy initializer can reference it without TDZ.
   const pairedWebRuntimeHost = isWebClient
     ? selectableHostOptions.find((host) => host.kind === 'runtime' && canSelectAddRepoHost(host))
     : undefined
+  const [selectedAddProjectHostId, setSelectedAddProjectHostId] = useState<ExecutionHostId>(() =>
+    isWebClient ? (pairedWebRuntimeHost?.id ?? LOCAL_EXECUTION_HOST_ID) : LOCAL_EXECUTION_HOST_ID
+  )
+  const [hostSelectorOpen, setHostSelectorOpen] = useState(false)
+  const previousOpenRef = useRef(false)
 
   const selectedHost =
     selectableHostOptions.find(
@@ -80,22 +82,31 @@ export function useAddRepoHostSelection({
     selectedParsedHost?.kind === 'ssh' ? selectedParsedHost.targetId : null
 
   useEffect(() => {
-    if (isOpen && !previousOpenRef.current) {
-      const focusedHostId = getSettingsFocusedExecutionHostId(settings)
-      const nextHostId = selectableHostOptions.some(
-        (host) => host.id === focusedHostId && canSelectAddRepoHost(host)
-      )
-        ? focusedHostId
-        : (pairedWebRuntimeHost?.id ?? (isWebClient ? null : LOCAL_EXECUTION_HOST_ID))
-      if (nextHostId) {
-        setSelectedAddProjectHostId(nextHostId)
+    if (isOpen) {
+      if (!previousOpenRef.current || (isWebClient && selectedHostId === null)) {
+        const focusedHostId = getSettingsFocusedExecutionHostId(settings)
+        const nextHostId = selectableHostOptions.some(
+          (host) => host.id === focusedHostId && canSelectAddRepoHost(host)
+        )
+          ? focusedHostId
+          : (pairedWebRuntimeHost?.id ?? (isWebClient ? null : LOCAL_EXECUTION_HOST_ID))
+        if (nextHostId) {
+          setSelectedAddProjectHostId(nextHostId)
+        }
       }
     }
     if (!isOpen) {
       setHostSelectorOpen(false)
     }
     previousOpenRef.current = isOpen
-  }, [isOpen, isWebClient, pairedWebRuntimeHost?.id, selectableHostOptions, settings])
+  }, [
+    isOpen,
+    isWebClient,
+    pairedWebRuntimeHost?.id,
+    selectableHostOptions,
+    selectedHostId,
+    settings
+  ])
 
   const handleSelectAddProjectHost = useCallback(
     async (hostId: ExecutionHostId): Promise<void> => {

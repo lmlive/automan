@@ -8,6 +8,7 @@ import {
 } from '../persistence'
 import { OrcaRuntimeRpcServer } from '../runtime/runtime-rpc'
 import { registerMobileHandlers } from '../ipc/mobile'
+import { registerSshHandlers } from '../ipc/ssh'
 import { getLocalPtyProvider, registerHeadlessPtyRuntime } from '../ipc/pty'
 import { LocalPtyProvider } from '../providers/local-pty-provider'
 import { HEADLESS_RUNTIME_WINDOW_ID } from '../../shared/runtime-types'
@@ -159,6 +160,10 @@ async function launchServeMode(
   }
   // Why: headless servers have no renderer graph publisher; publish an explicit empty graph so status clients see a ready server.
   runtime.syncWindowGraph(HEADLESS_RUNTIME_WINDOW_ID, { tabs: [], leaves: [] })
+  // Why: headless serve never runs attachMainWindowServices (the desktop registerSshHandlers call site),
+  // so SSH handlers are never registered. Register here with a null window so paired web clients
+  // can manage and connect SSH hosts over runtime RPC.
+  registerSshHandlers(state.store!, () => null, runtime)
   await runtimeRpc.start().catch((error) => {
     console.error('[runtime] Failed to start headless RPC transport:', error)
     throw error

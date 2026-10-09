@@ -41,7 +41,7 @@ export function renderServersSettingsSection(context: SettingsRenderContext): Re
 
 export function renderSshSettingsSection(context: SettingsRenderContext): React.JSX.Element | null {
   const { model, navigation, view } = context
-  return model.showDesktopOnlySettings ? (
+  return (
     <SettingsSection
       id="ssh"
       title={translate('auto.components.settings.Settings.9b02492d1f', 'SSH Hosts')}
@@ -55,7 +55,7 @@ export function renderSshSettingsSection(context: SettingsRenderContext): React.
         <SshPane addTargetIntentSignal={model.sshHostAddIntentSignal} />
       ) : null}
     </SettingsSection>
-  ) : null
+  )
 }
 
 export function renderDeveloperPermissionsSettingsSection(

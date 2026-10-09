@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react'
+import { isWebClientLocation } from '@/lib/web-client-location'
 import { restoreLocalStructuredChatsAtStartup } from '@/runtime/local-structured-chats'
 import { syncZoomCSSVar } from '@/lib/ui-zoom'
 import { installCodexDetachedPaneRestartExecutor } from '@/components/terminal-pane/codex-detached-pane-restart-scheduler'
@@ -41,9 +42,9 @@ import { ensureLocalRuntimeCapabilities } from '../runtime/local-runtime-capabil
 
 async function listRuntimeSessionHostIdsForStartup(): Promise<ExecutionHostId[]> {
   try {
-    return (await window.api.runtimeEnvironments.list()).map((environment) =>
-      toRuntimeExecutionHostId(environment.id)
-    )
+    const environments = await window.api.runtimeEnvironments.list()
+    useAppStore.getState().setRuntimeEnvironments(environments)
+    return environments.map((environment) => toRuntimeExecutionHostId(environment.id))
   } catch (err) {
     console.warn('Failed to list runtime session hosts for startup:', err)
     return []
@@ -125,21 +126,20 @@ export function useAppStartupHydration(onOnboardingLoaded: (state: OnboardingSta
           listRuntimeSessionHostIdsForStartup
         )
         runtimeHostsPromise.catch(() => {})
-        // Why: saved remote runtimes can spend the full connect timeout; load only the local catalog for first paint and refresh remotes after hydration.
+        const hostFilter = isWebClientLocation() ? undefined : { remoteHosts: 'skip' as const }
+        // Why: saved remote runtimes can spend full timeout; load local only for first paint unless web client.
         await timeRendererStartupStep('fetch-repos-local', () =>
-          actions.fetchReposForAllHosts({ remoteHosts: 'skip' })
+          actions.fetchReposForAllHosts(hostFilter)
         )
         await timeRendererStartupStep('repo-catalog-settlement', () =>
           actions.awaitLocalRepoCatalogSettlement()
         )
-        // Why: folder workspaces merge against projectGroups (repos.ts fetchFolderWorkspacesForAllHosts),
-        // so keep this chain ordered while overlapping it with session-scoped hydration.
         const localCatalogChain = (async () => {
           await timeRendererStartupStep('fetch-project-groups-local', () =>
-            actions.fetchProjectGroupsForAllHosts({ remoteHosts: 'skip' })
+            actions.fetchProjectGroupsForAllHosts(hostFilter)
           )
           await timeRendererStartupStep('fetch-folder-workspaces-local', () =>
-            actions.fetchFolderWorkspacesForAllHosts({ remoteHosts: 'skip' })
+            actions.fetchFolderWorkspacesForAllHosts(hostFilter)
           )
         })()
         const sessionReadPromise = runtimeHostsPromise.then((startupRuntimeHostIds) =>

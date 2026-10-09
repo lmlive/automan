@@ -1,4 +1,7 @@
+import { z } from 'zod'
 import { defineMethod } from '../core'
+import { persistedStore } from '../../../ipc/ssh-ipc-context'
+import { addRemoteRepoFromPath } from '../../../ipc/repos/remote-repo-registration'
 import { PROJECT_RUNTIME_METHODS } from './project-runtime-rpc-methods'
 import { FOLDER_WORKSPACE_METHODS } from './folder-workspace'
 import {
@@ -104,6 +107,27 @@ export const REPO_METHODS = [
         directories: params.directories
       })
     })
+  }),
+  defineMethod({
+    name: 'repo.addRemote',
+    params: z.object({
+      connectionId: z.string().min(1),
+      remotePath: z.string().min(1),
+      displayName: z.string().optional(),
+      kind: z.enum(['git', 'folder']).optional()
+    }),
+    handler: async (params, context) => {
+      if (!persistedStore) {
+        return { error: 'Store is not initialized' }
+      }
+      const result = await addRemoteRepoFromPath(persistedStore, params)
+      if ('error' in result) {
+        return result
+      }
+      return {
+        repo: projectRepoVisibilityForClient(result.repo, context)
+      }
+    }
   }),
   defineMethod({
     name: 'repo.add',

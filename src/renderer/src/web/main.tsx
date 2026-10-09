@@ -14,8 +14,10 @@ import {
 import {
   createStoredWebRuntimeEnvironment,
   readStoredWebRuntimeEnvironment,
+  redactStoredWebRuntimeEnvironment,
   saveStoredWebRuntimeEnvironment
 } from './web-runtime-environment'
+import { useAppStore } from '../store'
 import { installWebPreloadApi } from './web-preload-api'
 import { I18nProvider } from '../i18n/I18nProvider'
 import { translate } from '../i18n/i18n'
@@ -68,6 +70,12 @@ function WebRoot(): React.JSX.Element {
   }
 
   installWebPreloadApi()
+  const storedEnvironment = readStoredWebRuntimeEnvironment()
+  if (storedEnvironment) {
+    useAppStore
+      .getState()
+      .setRuntimeEnvironments([redactStoredWebRuntimeEnvironment(storedEnvironment)])
+  }
   return (
     <Suspense fallback={<div className="min-h-dvh bg-background" />}>
       <App />

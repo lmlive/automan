@@ -8,6 +8,7 @@ import { getRepoHostIdentity } from '../slices/repo-host-identity'
 import { getActiveRuntimeTarget } from '../../runtime/runtime-rpc-client'
 import { filterSetupScriptPromptDismissalsToValidRepos } from '@/lib/setup-script-prompt'
 import { getRepoExecutionHostId, LOCAL_EXECUTION_HOST_ID } from '../../../../shared/execution-host'
+import { isWebClientLocation } from '@/lib/web-client-location'
 import { isRemovedRuntimeHostId } from '../slices/stale-runtime-host-rows'
 import type { FetchedRepoCatalog } from './repo-catalog-merge'
 import type { LocalRepoCatalogFetchOutcome } from './repo-catalog-fencing'
@@ -119,14 +120,18 @@ export function createAllHostRepoCatalogActions(
       }
 
       // Local first so local repos are present even if a remote fetch stalls.
+      // Why: web client has no local IPC — skip the local pass and settle it as fulfilled
+      // so awaitLocalRepoCatalogSettlement() doesn't throw during startup hydration.
       let failed = false
       let localCatalogOutcome: LocalRepoCatalogFetchOutcome = { status: 'fulfilled' }
-      try {
-        applyCatalog(await fetchRepoCatalogForTarget({ kind: 'local' }))
-      } catch (err) {
-        failed = true
-        localCatalogOutcome = { status: 'rejected', reason: err }
-        console.error('Failed to fetch local repos for all-host load:', err)
+      if (!isWebClientLocation()) {
+        try {
+          applyCatalog(await fetchRepoCatalogForTarget({ kind: 'local' }))
+        } catch (err) {
+          failed = true
+          localCatalogOutcome = { status: 'rejected', reason: err }
+          console.error('Failed to fetch local repos for all-host load:', err)
+        }
       }
       // Why: startup hydration needs the newest local catalog, not unreachable remote hosts.
       settleLocalCatalog(localCatalogOutcome)

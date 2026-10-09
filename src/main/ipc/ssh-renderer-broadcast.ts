@@ -15,6 +15,7 @@ import {
 import { getSshProviderAuthority } from '../ssh/ssh-provider-authority'
 import { getSshPlainSshMode } from '../ssh/ssh-plain-ssh-mode'
 import { activeSessions } from './ssh-active-relay-sessions'
+import { emitSshRuntimeEvent } from './ssh-runtime-events'
 import {
   connectionManager,
   currentRuntime,
@@ -36,6 +37,7 @@ export function broadcastSshState(
     return
   }
   const enrichedState = withSshRemotePlatform(targetId, state)
+  emitSshRuntimeEvent({ type: 'stateChanged', targetId, state: enrichedState })
   const win = getMainWindow()
   if (win && !win.isDestroyed()) {
     win.webContents.send('ssh:state-changed', { targetId, state: enrichedState })
@@ -88,13 +90,15 @@ export function broadcastPortForwards(
   getMainWindow: () => BrowserWindow | null,
   targetId: string
 ): void {
+  const forwards = listForwardsEnriched(targetId)
+  emitSshRuntimeEvent({ type: 'portForwardsChanged', targetId, forwards })
   const win = getMainWindow()
   if (!win || win.isDestroyed()) {
     return
   }
   win.webContents.send('ssh:port-forwards-changed', {
     targetId,
-    forwards: listForwardsEnriched(targetId)
+    forwards
   })
 }
 
@@ -104,13 +108,15 @@ export function broadcastDetectedPorts(
   ports: DetectedPort[],
   options?: Parameters<typeof enrichSshDetectedPorts>[3]
 ): void {
+  const enriched = enrichDetected(targetId, ports, options)
+  emitSshRuntimeEvent({ type: 'detectedPortsChanged', targetId, ports: enriched })
   const win = getMainWindow()
   if (!win || win.isDestroyed()) {
     return
   }
   win.webContents.send('ssh:detected-ports-changed', {
     targetId,
-    ports: enrichDetected(targetId, ports, options)
+    ports: enriched
   })
 }
 

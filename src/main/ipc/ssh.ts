@@ -77,6 +77,25 @@ import { broadcastPortForwards, relayStateOverrides } from './ssh-renderer-broad
 import { resetSshShutdownDrain } from './ssh-shutdown-drain'
 import { registerSshTargetCrudHandlers } from './ssh-target-crud-handlers'
 import { targetLifecycleInFlight } from './ssh-target-lifecycle-queue'
+import { connectTarget } from './ssh-connect-flow'
+import { disconnectRegisteredSshTarget, removeRegisteredSshTarget } from './ssh-session-teardown'
+import {
+  terminateSessions,
+  resetRelay,
+  needsPassphrasePrompt,
+  testConnection
+} from './ssh-connection-handlers'
+import {
+  addPortForward,
+  updatePortForward,
+  removePortForward,
+  listPortForwards,
+  listDetectedPorts
+} from './ssh-port-forward-handlers'
+import { browseSshDirectory } from './ssh-browse'
+import { resolveCredentialRequest } from './ssh-passphrase'
+import { getPublicSshState } from './ssh-renderer-broadcast'
+import { registerSshOperations, clearSshOperations } from './ssh-operations'
 
 const SSH_IPC_CHANNELS = [
   'ssh:listTargets',
@@ -217,6 +236,28 @@ export function registerSshHandlers(
   registerSshConnectionHandlers()
   registerSshPortForwardHandlers()
 
+  registerSshOperations({
+    listTargets: () => getSshTargetRegistryStore()!.listTargets(),
+    addTarget: (target) => getSshTargetRegistryStore()!.addTarget(target),
+    updateTarget: (id, updates) => getSshTargetRegistryStore()!.updateTarget(id, updates),
+    removeTarget: (id) => removeRegisteredSshTarget(id),
+    importConfig: (args) => getSshTargetRegistryStore()!.importFromSshConfig(args),
+    connect: (targetId) => connectTarget(targetId),
+    disconnect: (targetId) => disconnectRegisteredSshTarget(targetId),
+    terminateSessions,
+    resetRelay,
+    getState: (targetId) => getPublicSshState(targetId),
+    needsPassphrasePrompt,
+    testConnection,
+    addPortForward,
+    updatePortForward,
+    removePortForward,
+    listPortForwards,
+    listDetectedPorts,
+    browseDir: (args) => browseSshDirectory(() => connectionManager, args),
+    submitCredential: (args) => resolveCredentialRequest(args.requestId, args.value)
+  })
+
   return {
     connectionManager: connectionManager!,
     sshStore: getSshTargetRegistryStore() as SshConnectionStore
@@ -224,6 +265,7 @@ export function registerSshHandlers(
 }
 
 export async function resetSshHandlerStateForTests(): Promise<void> {
+  clearSshOperations()
   unregisterAdvertisedUrlRefresh()
   unregisterPowerMonitorReconnect()
   for (const ch of SSH_IPC_CHANNELS) {
